@@ -1,0 +1,8 @@
+# Build artifact (produced by ./install.sh)
+/ZoomStupidWorkplaceAutominimizer
+
+# Local agent / editor state
+.claude/
+
+# macOS
+.DS_Store
