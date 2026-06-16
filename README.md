@@ -68,6 +68,20 @@ You can also run the binary directly for a one-off check:
 ZoomStupidWorkplaceAutominimizer --status
 ```
 
+### Using your own bundle id
+
+The default bundle id is the placeholder `com.example.ZoomStupidWorkplaceAutominimizer`.
+To brand your own build, set `ZWAM_BUNDLE_ID` when installing:
+
+```sh
+ZWAM_BUNDLE_ID="com.yourorg.ZoomStupidWorkplaceAutominimizer" ./install.sh install
+```
+
+The id drives the code-signing identifier, the LaunchAgent label, and the
+`os.Logger` subsystem. It's remembered (in `~/.config/ZoomStupidWorkplaceAutominimizer/`),
+so later `status`/`quit`/`uninstall` target the same install without re-setting
+the variable.
+
 ## Troubleshooting
 
 **`--status` says NOT granted, but the window still gets minimized.**

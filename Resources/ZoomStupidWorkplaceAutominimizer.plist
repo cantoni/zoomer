@@ -1,7 +1,9 @@
 <?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN"
   "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
-<!-- Template. install.sh fills in the binary path and log paths at install time. -->
+<!-- Template. install.sh fills in the bundle id (Label + ZWAM_BUNDLE_ID), the
+     binary path, and the log paths at install time. The com.example values below
+     are placeholders. -->
 <plist version="1.0">
 <dict>
     <key>Label</key>
@@ -11,6 +13,12 @@
     <array>
         <string>__BINARY_PATH__</string>
     </array>
+
+    <key>EnvironmentVariables</key>
+    <dict>
+        <key>ZWAM_BUNDLE_ID</key>
+        <string>com.example.ZoomStupidWorkplaceAutominimizer</string>
+    </dict>
 
     <key>RunAtLoad</key>
     <true/>

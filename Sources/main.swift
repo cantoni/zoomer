@@ -2,7 +2,11 @@ import ApplicationServices
 import AppKit
 import os
 
-let logger = Logger(subsystem: "com.example.ZoomStupidWorkplaceAutominimizer", category: "main")
+// Subsystem follows the configured bundle id (set by the LaunchAgent via
+// ZWAM_BUNDLE_ID); falls back to the placeholder for direct CLI runs.
+let bundleIdentifier = ProcessInfo.processInfo.environment["ZWAM_BUNDLE_ID"]
+    ?? "com.example.ZoomStupidWorkplaceAutominimizer"
+let logger = Logger(subsystem: bundleIdentifier, category: "main")
 let zoomBundleID = "us.zoom.xos"
 let targetWindowTitle = "Zoom Workplace"
 

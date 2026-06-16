@@ -2,11 +2,25 @@
 set -euo pipefail
 
 BINARY_NAME="ZoomStupidWorkplaceAutominimizer"
-IDENTIFIER="com.example.ZoomStupidWorkplaceAutominimizer"
+DEFAULT_IDENTIFIER="com.example.ZoomStupidWorkplaceAutominimizer"
+STATE_DIR="$HOME/.config/${BINARY_NAME}"
+STATE_FILE="${STATE_DIR}/bundle-id"
+
+# Bundle identifier, resolved as: ZWAM_BUNDLE_ID override > the id chosen at the
+# last install > the placeholder default. Brand your own build with, e.g.:
+#   ZWAM_BUNDLE_ID="com.yourorg.ZoomStupidWorkplaceAutominimizer" ./install.sh install
+if [ -n "${ZWAM_BUNDLE_ID:-}" ]; then
+    IDENTIFIER="$ZWAM_BUNDLE_ID"
+elif [ -f "$STATE_FILE" ]; then
+    IDENTIFIER="$(cat "$STATE_FILE")"
+else
+    IDENTIFIER="$DEFAULT_IDENTIFIER"
+fi
+
 # Per-user install dir so no sudo is needed (/usr/local/bin is root-owned).
 INSTALL_DIR="$HOME/.local/bin"
 INSTALLED_BINARY="$INSTALL_DIR/$BINARY_NAME"
-PLIST_SRC="Resources/${IDENTIFIER}.plist"
+PLIST_SRC="Resources/${BINARY_NAME}.plist"
 PLIST_DST="$HOME/Library/LaunchAgents/${IDENTIFIER}.plist"
 # User-owned logs (not /tmp, which is world-readable/writable).
 LOG_DIR="$HOME/Library/Logs"
@@ -42,13 +56,18 @@ case "${1:-install}" in
         mkdir -p "$INSTALL_DIR"
         cp "$BINARY_NAME" "$INSTALL_DIR/"
 
-        echo "Installing LaunchAgent…"
-        mkdir -p "$(dirname "$PLIST_DST")" "$LOG_DIR"
+        echo "Installing LaunchAgent (bundle id: ${IDENTIFIER})…"
+        mkdir -p "$(dirname "$PLIST_DST")" "$LOG_DIR" "$STATE_DIR"
         # Use PlistBuddy (not sed) so paths with shell/sed metacharacters are safe.
         cp "$PLIST_SRC" "$PLIST_DST"
+        /usr/libexec/PlistBuddy -c "Set :Label ${IDENTIFIER}" "$PLIST_DST"
         /usr/libexec/PlistBuddy -c "Set :ProgramArguments:0 ${INSTALLED_BINARY}" "$PLIST_DST"
         /usr/libexec/PlistBuddy -c "Set :StandardOutPath ${STDOUT_LOG}" "$PLIST_DST"
         /usr/libexec/PlistBuddy -c "Set :StandardErrorPath ${STDERR_LOG}" "$PLIST_DST"
+        /usr/libexec/PlistBuddy -c "Set :EnvironmentVariables:ZWAM_BUNDLE_ID ${IDENTIFIER}" "$PLIST_DST"
+
+        # Remember the chosen id so later subcommands (status/quit/uninstall…) target it.
+        printf '%s\n' "$IDENTIFIER" > "$STATE_FILE"
 
         # Reload (ignore errors if not already loaded).
         launchctl bootout "gui/$(id -u)/$IDENTIFIER" 2>/dev/null || true
@@ -168,6 +187,9 @@ case "${1:-install}" in
 
         echo "Removing Accessibility permission entry…"
         tccutil reset Accessibility "$IDENTIFIER" 2>/dev/null || true
+
+        rm -f "$STATE_FILE"
+        rmdir "$STATE_DIR" 2>/dev/null || true
 
         echo "Done. Uninstalled."
         ;;
