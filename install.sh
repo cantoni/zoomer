@@ -2,13 +2,16 @@
 set -euo pipefail
 
 BINARY_NAME="ZoomStupidWorkplaceAutominimizer"
-IDENTIFIER="com.nicemohawk.ZoomStupidWorkplaceAutominimizer"
+IDENTIFIER="com.example.ZoomStupidWorkplaceAutominimizer"
 # Per-user install dir so no sudo is needed (/usr/local/bin is root-owned).
 INSTALL_DIR="$HOME/.local/bin"
 INSTALLED_BINARY="$INSTALL_DIR/$BINARY_NAME"
 PLIST_SRC="Resources/${IDENTIFIER}.plist"
 PLIST_DST="$HOME/Library/LaunchAgents/${IDENTIFIER}.plist"
-STDOUT_LOG="/tmp/${BINARY_NAME}.stdout.log"
+# User-owned logs (not /tmp, which is world-readable/writable).
+LOG_DIR="$HOME/Library/Logs"
+STDOUT_LOG="${LOG_DIR}/${BINARY_NAME}.stdout.log"
+STDERR_LOG="${LOG_DIR}/${BINARY_NAME}.stderr.log"
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 
 daemon_pid() {
@@ -40,8 +43,12 @@ case "${1:-install}" in
         cp "$BINARY_NAME" "$INSTALL_DIR/"
 
         echo "Installing LaunchAgent…"
-        mkdir -p "$(dirname "$PLIST_DST")"
-        sed "s|__BINARY_PATH__|${INSTALLED_BINARY}|g" "$PLIST_SRC" > "$PLIST_DST"
+        mkdir -p "$(dirname "$PLIST_DST")" "$LOG_DIR"
+        # Use PlistBuddy (not sed) so paths with shell/sed metacharacters are safe.
+        cp "$PLIST_SRC" "$PLIST_DST"
+        /usr/libexec/PlistBuddy -c "Set :ProgramArguments:0 ${INSTALLED_BINARY}" "$PLIST_DST"
+        /usr/libexec/PlistBuddy -c "Set :StandardOutPath ${STDOUT_LOG}" "$PLIST_DST"
+        /usr/libexec/PlistBuddy -c "Set :StandardErrorPath ${STDERR_LOG}" "$PLIST_DST"
 
         # Reload (ignore errors if not already loaded).
         launchctl bootout "gui/$(id -u)/$IDENTIFIER" 2>/dev/null || true
@@ -155,6 +162,9 @@ case "${1:-install}" in
 
         echo "Removing binary…"
         rm -f "$INSTALLED_BINARY"
+
+        echo "Removing logs…"
+        rm -f "$STDOUT_LOG" "$STDERR_LOG"
 
         echo "Removing Accessibility permission entry…"
         tccutil reset Accessibility "$IDENTIFIER" 2>/dev/null || true

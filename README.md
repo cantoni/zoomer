@@ -103,14 +103,16 @@ With a stable signing identity, TCC matches by the certificate rather than the
 code hash, so you grant access once and rebuilds keep working.
 
 **Logs.** The agent logs via `os.Logger` (subsystem
-`com.nicemohawk.ZoomStupidWorkplaceAutominimizer`):
+`com.example.ZoomStupidWorkplaceAutominimizer`):
 
 ```sh
-log stream --predicate 'subsystem == "com.nicemohawk.ZoomStupidWorkplaceAutominimizer"'
+log stream --predicate 'subsystem == "com.example.ZoomStupidWorkplaceAutominimizer"'
 ```
 
-stdout/stderr also go to `/tmp/ZoomStupidWorkplaceAutominimizer.stdout.log` and
-`.stderr.log`.
+Full detail (including the diagnostic window dumps) is written only to the
+user-owned log file `~/Library/Logs/ZoomStupidWorkplaceAutominimizer.stdout.log`
+(and `.stderr.log`). The unified log gets only a title-free summary, so Zoom
+window titles aren't exposed there.
 
 ## Behavior notes
 
@@ -130,3 +132,11 @@ stdout/stderr also go to `/tmp/ZoomStupidWorkplaceAutominimizer.stdout.log` and
 ```sh
 ./install.sh uninstall
 ```
+
+## License
+
+Copyright © 2026 Nice Mohawk Limited. Released under the [MIT License](LICENSE).
+
+The bundle identifier (`com.example.ZoomStupidWorkplaceAutominimizer`) is a
+deliberate placeholder — change it to your own reverse-DNS identifier if you
+build and distribute your own copy.

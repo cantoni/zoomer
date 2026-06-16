@@ -1,12 +1,11 @@
 <?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN"
   "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
-<!-- Template. install.sh substitutes __BINARY_PATH__ and writes the result to
-     ~/Library/LaunchAgents/ at install time. -->
+<!-- Template. install.sh fills in the binary path and log paths at install time. -->
 <plist version="1.0">
 <dict>
     <key>Label</key>
-    <string>com.nicemohawk.ZoomStupidWorkplaceAutominimizer</string>
+    <string>com.example.ZoomStupidWorkplaceAutominimizer</string>
 
     <key>ProgramArguments</key>
     <array>
@@ -26,9 +25,9 @@
     <string>Background</string>
 
     <key>StandardOutPath</key>
-    <string>/tmp/ZoomStupidWorkplaceAutominimizer.stdout.log</string>
+    <string>__STDOUT_LOG__</string>
 
     <key>StandardErrorPath</key>
-    <string>/tmp/ZoomStupidWorkplaceAutominimizer.stderr.log</string>
+    <string>__STDERR_LOG__</string>
 </dict>
 </plist>

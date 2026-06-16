@@ -2,7 +2,7 @@ import ApplicationServices
 import AppKit
 import os
 
-let logger = Logger(subsystem: "com.nicemohawk.ZoomStupidWorkplaceAutominimizer", category: "main")
+let logger = Logger(subsystem: "com.example.ZoomStupidWorkplaceAutominimizer", category: "main")
 let zoomBundleID = "us.zoom.xos"
 let targetWindowTitle = "Zoom Workplace"
 
@@ -34,8 +34,10 @@ func copyZoomWindows(pid: pid_t) -> (error: AXError, windows: [AXUIElement]) {
 
 // MARK: - Diagnostics
 
-/// Emits to both stdout (captured in /tmp/…stdout.log for a LaunchAgent) and the
-/// unified log at notice level (persisted, visible via `log show`).
+/// Emits to both stdout (captured in the user-only log file for a LaunchAgent)
+/// and the unified log at notice level (persisted, visible via `log show`).
+/// Only pass non-sensitive, operational text here — unified-log entries are
+/// `.public`. Window titles must NOT go through this; see `dumpZoomWindows`.
 func emit(_ text: String) {
     print(text)
     fflush(stdout)
@@ -43,7 +45,10 @@ func emit(_ text: String) {
 }
 
 /// Read-only snapshot of every Zoom window and its key attributes. Never mutates
-/// anything, so it's safe to trigger during a live call.
+/// anything, so it's safe to trigger during a live call. Window titles can carry
+/// sensitive content (meeting topics, document names), so full detail is written
+/// only to the user-owned local log file; the unified log gets a title-free
+/// summary.
 func dumpZoomWindows(reason: String) {
     let trusted = AXIsProcessTrusted()
     guard let app = zoomApplication() else {
@@ -51,8 +56,9 @@ func dumpZoomWindows(reason: String) {
         return
     }
     let (error, windows) = copyZoomWindows(pid: app.processIdentifier)
-    var lines = ["[dump:\(reason)] trusted=\(trusted) pid=\(app.processIdentifier) "
-        + "AXError=\(error.rawValue) windowCount=\(windows.count)"]
+    let summary = "[dump:\(reason)] trusted=\(trusted) pid=\(app.processIdentifier) "
+        + "AXError=\(error.rawValue) windowCount=\(windows.count)"
+    var lines = [summary]
     for (index, window) in windows.enumerated() {
         let title = axString(window, kAXTitleAttribute as String) ?? "<nil>"
         let role = axString(window, kAXRoleAttribute as String) ?? "<nil>"
@@ -65,7 +71,12 @@ func dumpZoomWindows(reason: String) {
     if let until = snoozeUntil, Date() < until {
         lines.append("  snoozed (auto-minimize paused for \(Int(until.timeIntervalSinceNow)) more seconds)")
     }
-    emit(lines.joined(separator: "\n"))
+
+    // Full detail (incl. titles) -> user-only local log file only.
+    print(lines.joined(separator: "\n"))
+    fflush(stdout)
+    // Unified log -> title-free summary (it's broadly readable and persisted).
+    logger.notice("\(summary, privacy: .public) (window details in local log only)")
 }
 
 // MARK: - Window handling
