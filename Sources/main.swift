@@ -327,6 +327,9 @@ func printStatus() {
     print("  executable:    \(resolvedExecutablePath())")
     print("  accessibility: \(trusted ? "granted" : "NOT granted")")
     print("  zoom running:  \(zoomRunning ? "yes" : "no")")
+    print("  note: run from a terminal, 'accessibility' reflects the terminal's")
+    print("        grant, not this binary's. The launchd daemon is authoritative;")
+    print("        use './install.sh status' to read the daemon's real state.")
 
     if !trusted {
         print("")

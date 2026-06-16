@@ -65,15 +65,31 @@ case "${1:-install}" in
         ;;
 
     status)
-        if [ -x "$INSTALLED_BINARY" ]; then
-            "$INSTALLED_BINARY" --status
-        else
-            echo "Not installed at ${INSTALLED_BINARY}. Run './install.sh install' first."
-            exit 1
+        PID="$(daemon_pid)"
+        if [ -z "$PID" ]; then
+            echo "Daemon: not running."
+            if [ -x "$INSTALLED_BINARY" ]; then
+                echo "(No daemon to ask. A direct '--status' below reflects THIS"
+                echo " terminal's Accessibility grant, not the installed binary's.)"
+                "$INSTALLED_BINARY" --status
+            else
+                echo "Not installed. Run './install.sh install' first."
+            fi
+            exit 0
         fi
-        echo ""
-        echo "LaunchAgent:"
-        launchctl print "gui/$(id -u)/$IDENTIFIER" 2>/dev/null | grep -E "state|pid" | sed 's/^/  /' || echo "  not loaded"
+
+        echo "Daemon: running (pid ${PID})"
+
+        # Authoritative: ask the running daemon, which has the real launchd TCC
+        # context. A fresh '--status' from a terminal reports the *terminal's*
+        # grant instead, so it can wrongly say NOT granted while the daemon works.
+        kill -USR1 "$PID" 2>/dev/null || true
+        sleep 0.4
+        case "$(grep -oE 'trusted=(true|false)' "$STDOUT_LOG" 2>/dev/null | tail -n1)" in
+            trusted=true)  echo "Accessibility (daemon): granted" ;;
+            trusted=false) echo "Accessibility (daemon): NOT granted — grant ${INSTALLED_BINARY}" ;;
+            *)             echo "Accessibility (daemon): unknown (no dump in log yet)" ;;
+        esac
         ;;
 
     dump)
@@ -92,6 +108,37 @@ case "${1:-install}" in
     logs)
         echo "--- ${STDOUT_LOG} ---"
         tail -n 60 "$STDOUT_LOG" 2>/dev/null || echo "(empty)"
+        ;;
+
+    quit|stop)
+        if [ -z "$(daemon_pid)" ]; then
+            echo "Not running."
+            exit 0
+        fi
+        echo "Stopping ${BINARY_NAME}…"
+        # bootout, not kill: with KeepAlive the agent would otherwise just respawn.
+        launchctl bootout "gui/$(id -u)/$IDENTIFIER" 2>/dev/null || true
+        sleep 0.3
+        if [ -z "$(daemon_pid)" ]; then
+            echo "Stopped. Starts again at next login; run './install.sh start' to start it now."
+        else
+            echo "Still running (pid $(daemon_pid)) — failed to stop."
+            exit 1
+        fi
+        ;;
+
+    start)
+        if [ ! -f "$PLIST_DST" ]; then
+            echo "Not installed. Run './install.sh install' first."
+            exit 1
+        fi
+        if [ -n "$(daemon_pid)" ]; then
+            echo "Already running (pid $(daemon_pid))."
+            exit 0
+        fi
+        echo "Starting ${BINARY_NAME}…"
+        launchctl bootstrap "gui/$(id -u)" "$PLIST_DST"
+        echo "Started. Verify with './install.sh status'."
         ;;
 
     reset-permission)
@@ -116,7 +163,7 @@ case "${1:-install}" in
         ;;
 
     *)
-        echo "Usage: $0 [install|status|dump|logs|reset-permission|uninstall]"
+        echo "Usage: $0 [install|start|quit|status|dump|logs|reset-permission|uninstall]"
         exit 1
         ;;
 esac

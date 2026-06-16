@@ -54,6 +54,8 @@ Zoom; the Workplace window should minimize on its own.
 | Command | What it does |
 | --- | --- |
 | `./install.sh install` | Build, sign, install, load the agent, open the grant UI |
+| `./install.sh quit` | Stop the running agent (it restarts at next login) |
+| `./install.sh start` | Start the installed agent again (no rebuild, keeps the grant) |
 | `./install.sh status` | Print accessibility status + LaunchAgent state |
 | `./install.sh dump` | Trigger a read-only dump of Zoom's current windows (safe during a call) |
 | `./install.sh logs` | Show the daemon's recent activity log |
@@ -67,6 +69,14 @@ ZoomStupidWorkplaceAutominimizer --status
 ```
 
 ## Troubleshooting
+
+**`--status` says NOT granted, but the window still gets minimized.**
+That's expected and not a bug. When you run the binary from a terminal,
+`AXIsProcessTrusted()` reflects the *terminal's* Accessibility grant (the terminal
+is the "responsible process" for tools it launches), not the installed binary's.
+The actual daemon is launched by `launchd`, is its own responsible process, and
+uses the binary's grant — so it's trusted and works. Always check the authoritative
+state with `./install.sh status`, which asks the running daemon directly.
 
 **`accessibility: NOT granted` even though the toggle is on.**
 The binary is **ad-hoc signed**, so macOS keys the Accessibility grant to the
