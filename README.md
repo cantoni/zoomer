@@ -1,6 +1,6 @@
 # ZoomStupidWorkplaceAutominimizer
 
-A tiny macOS background agent that automatically minimizes the **Zoom Workplace**
+A tiny macOS LaunchAgent that automatically minimizes the **Zoom Workplace**
 window whenever Zoom launches. Meeting windows are left alone — only the window
 titled exactly `Zoom Workplace` is touched.
 

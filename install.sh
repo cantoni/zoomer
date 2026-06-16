@@ -142,7 +142,7 @@ case "${1:-install}" in
             exit 0
         fi
         echo "Stopping ${BINARY_NAME}…"
-        # bootout, not kill: with KeepAlive the agent would otherwise just respawn.
+        # bootout, not kill: with KeepAlive the LaunchAgent would otherwise just respawn.
         launchctl bootout "gui/$(id -u)/$IDENTIFIER" 2>/dev/null || true
         sleep 0.3
         if [ -z "$(daemon_pid)" ]; then
