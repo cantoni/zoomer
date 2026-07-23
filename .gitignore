@@ -1,5 +1,6 @@
-# Build artifact (produced by ./install.sh)
+# Build artifacts (the top-level path was used by older installers)
 /ZoomStupidWorkplaceAutominimizer
+/.build/
 
 # Local agent / editor state
 .claude/

@@ -27,9 +27,14 @@ LOG_DIR="$HOME/Library/Logs"
 STDOUT_LOG="${LOG_DIR}/${BINARY_NAME}.stdout.log"
 STDERR_LOG="${LOG_DIR}/${BINARY_NAME}.stderr.log"
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
+BUILD_DIR="${SCRIPT_DIR}/.build"
+BUILD_BINARY="${BUILD_DIR}/${BINARY_NAME}"
 
 daemon_pid() {
-    launchctl print "gui/$(id -u)/$IDENTIFIER" 2>/dev/null | awk '/[^a-z]pid =/{print $3; exit}'
+    # A missing service is the normal "not running" case. Keep the pipeline from
+    # terminating the script under `set -o pipefail`.
+    launchctl print "gui/$(id -u)/$IDENTIFIER" 2>/dev/null |
+        awk '/[^a-z]pid =/{print $3; exit}' || true
 }
 
 cd "$SCRIPT_DIR"
@@ -42,10 +47,12 @@ SIGN_IDENTITY="${ZWAM_SIGN_IDENTITY:--}"
 
 build() {
     echo "Building…"
-    swiftc -O -o "$BINARY_NAME" Sources/main.swift
+    mkdir -p "$BUILD_DIR"
+    swiftc -module-cache-path "${BUILD_DIR}/ModuleCache" \
+        -O -o "$BUILD_BINARY" Sources/main.swift
 
     echo "Signing (identity: ${SIGN_IDENTITY})…"
-    codesign --force --sign "$SIGN_IDENTITY" --identifier "$IDENTIFIER" "$BINARY_NAME"
+    codesign --force --sign "$SIGN_IDENTITY" --identifier "$IDENTIFIER" "$BUILD_BINARY"
 }
 
 case "${1:-install}" in
@@ -54,7 +61,7 @@ case "${1:-install}" in
 
         echo "Installing binary to ${INSTALLED_BINARY}…"
         mkdir -p "$INSTALL_DIR"
-        cp "$BINARY_NAME" "$INSTALL_DIR/"
+        cp "$BUILD_BINARY" "$INSTALLED_BINARY"
 
         echo "Installing LaunchAgent (bundle id: ${IDENTIFIER})…"
         mkdir -p "$(dirname "$PLIST_DST")" "$LOG_DIR" "$STATE_DIR"
