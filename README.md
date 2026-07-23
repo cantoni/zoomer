@@ -2,13 +2,15 @@
 
 A tiny macOS LaunchAgent that automatically minimizes the **Zoom Workplace**
 window whenever Zoom launches. Meeting windows are left alone — only the window
-titled exactly `Zoom Workplace` is touched.
+titled exactly `Zoom Workplace` is minimized. When a meeting or webinar starts,
+the agent also turns off Zoom's **Show chat previews** option for that session.
 
 It is event-driven (no polling loop): it watches Zoom launch, activation, and
 window events via `NSWorkspace` and an `AXObserver`, and minimizes the window
-through the Accessibility API. Because it reacts to window events, it keeps the
-Workplace window minimized even if you reopen it (e.g. from the Dock) or Zoom
-restores it when a meeting ends.
+through the Accessibility API. It uses that same API to inspect Zoom's
+in-meeting chat preview checkbox and toggles it only when it is enabled. Because
+it reacts to window events, it keeps the Workplace window minimized if you reopen it
+(e.g. from the Dock) or Zoom restores it when a meeting ends.
 
 > Status: **beta**. Built for personal use; English window titles only.
 
@@ -139,6 +141,9 @@ window titles aren't exposed there.
   `Sources/main.swift`.
 - Only the window titled exactly `Zoom Workplace` is ever touched. The meeting
   window (`Zoom Meeting`) is never minimized.
+- Zoom does not persist **Show chat previews** between meetings, so the agent
+  turns it off once for each new meeting or webinar. If it is already off, the
+  agent leaves it off.
 - Title matching is exact, so non-English Zoom UIs are not yet handled.
 
 ## Uninstall

@@ -9,6 +9,8 @@ let bundleIdentifier = ProcessInfo.processInfo.environment["ZWAM_BUNDLE_ID"]
 let logger = Logger(subsystem: bundleIdentifier, category: "main")
 let zoomBundleID = "us.zoom.xos"
 let targetWindowTitle = "Zoom Workplace"
+let meetingWindowTitles = ["Zoom Meeting", "Zoom Webinar"]
+let chatPreviewCheckboxLabel = "Show chat previews"
 
 // MARK: - Accessibility helpers
 
@@ -34,6 +36,68 @@ func copyZoomWindows(pid: pid_t) -> (error: AXError, windows: [AXUIElement]) {
     var windowsRef: CFTypeRef?
     let result = AXUIElementCopyAttributeValue(appElement, kAXWindowsAttribute as CFString, &windowsRef)
     return (result, (windowsRef as? [AXUIElement]) ?? [])
+}
+
+func axChildren(_ element: AXUIElement) -> [AXUIElement] {
+    var ref: CFTypeRef?
+    guard AXUIElementCopyAttributeValue(
+        element,
+        kAXChildrenAttribute as CFString,
+        &ref
+    ) == .success else {
+        return []
+    }
+    return (ref as? [AXUIElement]) ?? []
+}
+
+func axElement(_ lhs: AXUIElement?, isSameAs rhs: AXUIElement?) -> Bool {
+    guard let lhs, let rhs else { return false }
+    return CFEqual(lhs, rhs)
+}
+
+func axElement(_ element: AXUIElement, hasLabel expected: String) -> Bool {
+    let attributes = [
+        kAXTitleAttribute,
+        kAXDescriptionAttribute,
+        kAXHelpAttribute,
+        kAXIdentifierAttribute,
+    ]
+    return attributes.contains { attribute in
+        axString(element, attribute as String)?
+            .caseInsensitiveCompare(expected) == .orderedSame
+    }
+}
+
+/// Breadth-first AX descendant search with a hard cap so an unexpected Zoom UI
+/// hierarchy can never make us walk indefinitely.
+func findAXElement(
+    below root: AXUIElement,
+    role expectedRole: String? = nil,
+    label expectedLabel: String,
+    limit: Int = 2_000
+) -> AXUIElement? {
+    var queue = [root]
+    var index = 0
+
+    while index < queue.count && index < limit {
+        let element = queue[index]
+        index += 1
+
+        let roleMatches = expectedRole == nil
+            || axString(element, kAXRoleAttribute as String) == expectedRole
+        if roleMatches, axElement(element, hasLabel: expectedLabel) {
+            return element
+        }
+
+        queue.append(contentsOf: axChildren(element))
+    }
+    return nil
+}
+
+func axActionNames(_ element: AXUIElement) -> [String] {
+    var names: CFArray?
+    guard AXUIElementCopyActionNames(element, &names) == .success else { return [] }
+    return (names as? [String]) ?? []
 }
 
 // MARK: - Diagnostics
@@ -81,6 +145,43 @@ func dumpZoomWindows(reason: String) {
     fflush(stdout)
     // Unified log -> title-free summary (it's broadly readable and persisted).
     logger.notice("\(summary, privacy: .public) (window details in local log only)")
+}
+
+/// On chat-preview automation failure, print only AX elements that look related
+/// to chat or preview controls. Details stay in the user-owned stdout log because
+/// arbitrary Accessibility labels could contain private meeting text.
+func dumpChatAXCandidates(window: AXUIElement, reason: String) {
+    var queue = [window]
+    var index = 0
+    var lines = ["[chat-ax:\(reason)] candidate controls:"]
+
+    while index < queue.count && index < 2_000 {
+        let element = queue[index]
+        index += 1
+        let role = axString(element, kAXRoleAttribute as String) ?? ""
+        let title = axString(element, kAXTitleAttribute as String) ?? ""
+        let description = axString(element, kAXDescriptionAttribute as String) ?? ""
+        let help = axString(element, kAXHelpAttribute as String) ?? ""
+        let identifier = axString(element, kAXIdentifierAttribute as String) ?? ""
+        let searchable = [title, description, help, identifier]
+            .joined(separator: " ")
+            .lowercased()
+
+        if searchable.contains("chat")
+            || searchable.contains("preview")
+            || searchable.contains("toolbar") {
+            lines.append(
+                "  role=\(role) title=\"\(title)\" description=\"\(description)\" "
+                    + "help=\"\(help)\" identifier=\"\(identifier)\" "
+                    + "actions=\(axActionNames(element))"
+            )
+        }
+        queue.append(contentsOf: axChildren(element))
+    }
+
+    print(lines.joined(separator: "\n"))
+    fflush(stdout)
+    logger.notice("[chat-ax:\(reason, privacy: .public)] wrote \(lines.count - 1, privacy: .public) candidates to local log")
 }
 
 // MARK: - Window handling
@@ -226,6 +327,110 @@ func scheduleMinimize(pid: pid_t, reason: String, maxAttempts: Int, interval: Ti
     }
 }
 
+// MARK: - Chat preview handling
+
+// Zoom deliberately resets "Show chat previews" for every meeting and exposes
+// no persistent preference for it. Use the labels Zoom publishes to macOS
+// Accessibility rather than fragile screen coordinates.
+var handledChatPreviewWindow: AXUIElement?
+var pressedChatPreviewCheckboxWindow: AXUIElement?
+var chatPreviewTimer: Timer?
+
+func meetingWindow(pid: pid_t) -> AXUIElement? {
+    let (error, windows) = copyZoomWindows(pid: pid)
+    guard error == .success else { return nil }
+    return windows.first { window in
+        guard let title = axString(window, kAXTitleAttribute as String) else { return false }
+        return meetingWindowTitles.contains(title)
+    }
+}
+
+enum ChatPreviewAttempt {
+    case done
+    case waiting
+    case noMeeting
+}
+
+func disableChatPreviewsIfNeeded(pid: pid_t, reason: String) -> ChatPreviewAttempt {
+    guard let window = meetingWindow(pid: pid) else {
+        handledChatPreviewWindow = nil
+        pressedChatPreviewCheckboxWindow = nil
+        return .noMeeting
+    }
+
+    if axElement(window, isSameAs: handledChatPreviewWindow) {
+        return .done
+    }
+
+    // Zoom exposes the setting directly in the meeting window's AX tree, even
+    // when its settings panel is not visible.
+    if let checkbox = findAXElement(
+        below: window,
+        role: kAXCheckBoxRole as String,
+        label: chatPreviewCheckboxLabel
+    ) {
+        switch axBool(checkbox, kAXValueAttribute as String) {
+        case true:
+            if !axElement(window, isSameAs: pressedChatPreviewCheckboxWindow) {
+                guard AXUIElementPerformAction(
+                    checkbox,
+                    kAXPressAction as CFString
+                ) == .success else {
+                    logger.notice("Failed to press the chat preview checkbox (\(reason, privacy: .public))")
+                    return .waiting
+                }
+                pressedChatPreviewCheckboxWindow = window
+                emit("Found Zoom meeting; disabling chat previews (checkbox)")
+            }
+            // Confirm the value on the next retry rather than assuming Zoom
+            // applied an asynchronous checkbox action.
+            return .waiting
+
+        case false:
+            if axElement(window, isSameAs: pressedChatPreviewCheckboxWindow) {
+                emit("Disabled Zoom chat previews for this meeting")
+            } else {
+                emit("Zoom chat previews already disabled for this meeting")
+            }
+            handledChatPreviewWindow = window
+            pressedChatPreviewCheckboxWindow = nil
+            return .done
+
+        case nil:
+            logger.notice("Could not read the chat preview checkbox value")
+            return .waiting
+        }
+    }
+
+    return .waiting
+}
+
+func scheduleDisableChatPreviews(
+    pid: pid_t,
+    reason: String,
+    maxAttempts: Int,
+    interval: TimeInterval
+) {
+    if disableChatPreviewsIfNeeded(pid: pid, reason: reason) == .done { return }
+    if chatPreviewTimer?.isValid == true { return }
+
+    var attempts = 0
+    chatPreviewTimer = Timer.scheduledTimer(withTimeInterval: interval, repeats: true) { timer in
+        attempts += 1
+        let result = disableChatPreviewsIfNeeded(pid: pid, reason: reason)
+        if result == .done || attempts >= maxAttempts {
+            if attempts >= maxAttempts && result != .noMeeting {
+                if let window = meetingWindow(pid: pid) {
+                    dumpChatAXCandidates(window: window, reason: "timeout")
+                }
+                emit("Could not disable Zoom chat previews after \(attempts) attempts")
+            }
+            timer.invalidate()
+            chatPreviewTimer = nil
+        }
+    }
+}
+
 // MARK: - AX window observer
 
 // Catches the Workplace window reappearing (reopened from the Dock, or restored
@@ -252,6 +457,12 @@ func axObserverCallback(
     guard observedPID != 0 else { return }
     logger.debug("AX event: \(notification as String, privacy: .public)")
     scheduleMinimize(pid: observedPID, reason: "ax:\(notification as String)", maxAttempts: 8, interval: 0.4)
+    scheduleDisableChatPreviews(
+        pid: observedPID,
+        reason: "ax:\(notification as String)",
+        maxAttempts: 20,
+        interval: 0.4
+    )
 }
 
 func registerAXObserver(pid: pid_t) {
@@ -285,11 +496,23 @@ func registerAXObserver(pid: pid_t) {
 // Signal source must be retained for the lifetime of the process.
 var sigusr1Source: DispatchSourceSignal?
 
+func installDiagnosticSignalHandler() {
+    // Install this before any AX work or permission waiting. That guarantees
+    // status/dump cannot terminate the daemon even if Zoom is currently holding
+    // an Accessibility call open.
+    signal(SIGUSR1, SIG_IGN)
+    let source = DispatchSource.makeSignalSource(signal: SIGUSR1, queue: .main)
+    source.setEventHandler { dumpZoomWindows(reason: "SIGUSR1") }
+    source.resume()
+    sigusr1Source = source
+}
+
 func handleZoom(pid: pid_t, reason: String) {
     resetSessionState()   // a (re)launched Zoom is a fresh session: clear snooze/reopen tracking
     dumpZoomWindows(reason: reason)
     registerAXObserver(pid: pid)
     scheduleMinimize(pid: pid, reason: reason, maxAttempts: 30, interval: 1.0)
+    scheduleDisableChatPreviews(pid: pid, reason: reason, maxAttempts: 45, interval: 1.0)
 }
 
 func startWatching() {
@@ -309,6 +532,12 @@ func startWatching() {
         guard let app = note.userInfo?[NSWorkspace.applicationUserInfoKey] as? NSRunningApplication,
               app.bundleIdentifier == zoomBundleID else { return }
         scheduleMinimize(pid: app.processIdentifier, reason: "activate", maxAttempts: 8, interval: 0.4)
+        scheduleDisableChatPreviews(
+            pid: app.processIdentifier,
+            reason: "activate",
+            maxAttempts: 12,
+            interval: 0.4
+        )
     }
 
     // Zoom already running when we start (e.g. at login).
@@ -316,13 +545,6 @@ func startWatching() {
         emit("Zoom already running (pid \(zoomApp.processIdentifier))")
         handleZoom(pid: zoomApp.processIdentifier, reason: "startup-scan")
     }
-
-    // SIGUSR1 -> read-only window dump on demand (safe during a live call).
-    signal(SIGUSR1, SIG_IGN)
-    let source = DispatchSource.makeSignalSource(signal: SIGUSR1, queue: .main)
-    source.setEventHandler { dumpZoomWindows(reason: "SIGUSR1") }
-    source.resume()
-    sigusr1Source = source
 
     emit("Watching for Zoom (launch + activate + window events); SIGUSR1 dumps windows")
 }
@@ -372,12 +594,14 @@ if arguments.contains("--windows") {
     exit(0)
 }
 
+installDiagnosticSignalHandler()
+
 if AXIsProcessTrusted() {
     startWatching()
 } else {
     // Don't exit — that would make launchd respawn us in a loop. Instead wait
     // for the user to grant permission and start the moment it lands.
-    logger.warning("Accessibility not granted yet; waiting for permission…")
+    emit("Accessibility not granted; waiting for permission")
     Timer.scheduledTimer(withTimeInterval: 2.0, repeats: true) { timer in
         if AXIsProcessTrusted() {
             emit("Accessibility granted; starting")

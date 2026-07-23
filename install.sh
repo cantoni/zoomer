@@ -116,12 +116,21 @@ case "${1:-install}" in
         # Authoritative: ask the running daemon, which has the real launchd TCC
         # context. A fresh '--status' from a terminal reports the *terminal's*
         # grant instead, so it can wrongly say NOT granted while the daemon works.
+        # Only inspect bytes written in response to this signal; otherwise a
+        # non-responsive daemon could make us report a stale result from an old
+        # process as though it were current.
+        LOG_BYTES=0
+        if [ -f "$STDOUT_LOG" ]; then
+            LOG_BYTES="$(wc -c < "$STDOUT_LOG" | tr -d ' ')"
+        fi
         kill -USR1 "$PID" 2>/dev/null || true
         sleep 0.4
-        case "$(grep -oE 'trusted=(true|false)' "$STDOUT_LOG" 2>/dev/null | tail -n1)" in
+        NEW_LOG="$(tail -c "+$((LOG_BYTES + 1))" "$STDOUT_LOG" 2>/dev/null || true)"
+        TRUSTED_STATE="$(printf '%s\n' "$NEW_LOG" | grep -oE 'trusted=(true|false)' | tail -n1 || true)"
+        case "$TRUSTED_STATE" in
             trusted=true)  echo "Accessibility (daemon): granted" ;;
             trusted=false) echo "Accessibility (daemon): NOT granted — grant ${INSTALLED_BINARY}" ;;
-            *)             echo "Accessibility (daemon): unknown (no dump in log yet)" ;;
+            *)             echo "Accessibility (daemon): unknown (daemon did not respond)" ;;
         esac
         ;;
 
