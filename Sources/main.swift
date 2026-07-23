@@ -136,10 +136,6 @@ func dumpZoomWindows(reason: String) {
         lines.append("  [\(index)] title=\"\(title)\" role=\(role) subrole=\(subrole) "
             + "minimized=\(minimized) main=\(main)")
     }
-    if let until = snoozeUntil, Date() < until {
-        lines.append("  snoozed (auto-minimize paused for \(Int(until.timeIntervalSinceNow)) more seconds)")
-    }
-
     // Full detail (incl. titles) -> user-only local log file only.
     print(lines.joined(separator: "\n"))
     fflush(stdout)
@@ -186,143 +182,179 @@ func dumpChatAXCandidates(window: AXUIElement, reason: String) {
 
 // MARK: - Window handling
 
-// Only ever touches a window titled *exactly* "Zoom Workplace", so the meeting
-// window ("Zoom Meeting") is never affected.
-enum WorkplaceWindowState {
-    case absent              // no Workplace window right now
-    case minimized           // present and already minimized
-    case open(AXUIElement)   // present and visible
+enum CloseWorkplaceAttempt {
+    case done
+    case waiting
+    case noMeeting
 }
 
-func workplaceWindowState(pid: pid_t) -> WorkplaceWindowState {
+var handledWorkplaceCloseMeetingWindow: AXUIElement?
+var requestedWorkplaceCloseMeetingWindow: AXUIElement?
+
+/// Closes only the window titled exactly "Zoom Workplace", and only while an
+/// exact meeting or webinar window is present.
+func closeWorkplaceWindowIfMeetingStarted(pid: pid_t, reason: String) -> CloseWorkplaceAttempt {
     let (error, windows) = copyZoomWindows(pid: pid)
     guard error == .success else {
         logger.notice("Could not read windows (AXError: \(error.rawValue, privacy: .public))")
-        return .absent
+        return .waiting
     }
-    for window in windows {
-        guard axString(window, kAXTitleAttribute as String) == targetWindowTitle else { continue }
-        if axBool(window, kAXMinimizedAttribute as String) == true { return .minimized }
-        return .open(window)
+    guard let meetingWindow = windows.first(where: { window in
+        guard let title = axString(window, kAXTitleAttribute as String) else { return false }
+        return meetingWindowTitles.contains(title)
+    }) else {
+        handledWorkplaceCloseMeetingWindow = nil
+        requestedWorkplaceCloseMeetingWindow = nil
+        return .noMeeting
     }
-    return .absent
-}
 
-// MARK: - Snooze (double-reopen escape hatch)
+    observeMeetingEnd(for: meetingWindow)
 
-// Reopening the Workplace window a second time within `reopenDoubleTapWindow`
-// seconds suspends auto-minimizing for `snoozeDuration`. State below is only ever
-// touched on the main run loop, so no locking is needed.
-let reopenDoubleTapWindow: TimeInterval = 5.0
-let snoozeDuration: TimeInterval = 15 * 60
-
-var hasMinimizedThisSession = false   // distinguishes the first open from a reopen
-var lastReopenAt: Date?               // when we last minimized a genuine reopen
-var pendingMinimize = false           // we asked to minimize but haven't confirmed it applied
-var snoozeUntil: Date?
-var snoozeTimer: Timer?
-
-func isSnoozing() -> Bool {
-    if let until = snoozeUntil, Date() < until { return true }
-    return false
-}
-
-func resetSessionState() {
-    hasMinimizedThisSession = false
-    lastReopenAt = nil
-    pendingMinimize = false
-    snoozeUntil = nil
-    snoozeTimer?.invalidate()
-    snoozeTimer = nil
-}
-
-func beginSnooze(pid: pid_t) {
-    let until = Date().addingTimeInterval(snoozeDuration)
-    snoozeUntil = until
-    lastReopenAt = nil
-    snoozeTimer?.invalidate()
-    snoozeTimer = Timer.scheduledTimer(withTimeInterval: snoozeDuration, repeats: false) { _ in
-        snoozeUntil = nil
-        snoozeTimer = nil
-        lastReopenAt = nil
-        emit("Snooze ended; auto-minimize resumed")
-        _ = processWorkplaceWindow(pid: pid, reason: "snooze-end")
+    if axElement(meetingWindow, isSameAs: handledWorkplaceCloseMeetingWindow) {
+        return .done
     }
-    emit("Snooze: leaving \"\(targetWindowTitle)\" open for \(Int(snoozeDuration / 60)) min (double reopen)")
+
+    guard let workplaceWindow = windows.first(where: {
+        axString($0, kAXTitleAttribute as String) == targetWindowTitle
+    }) else {
+        if axElement(meetingWindow, isSameAs: requestedWorkplaceCloseMeetingWindow) {
+            emit("Meeting started; closed \"\(targetWindowTitle)\"")
+        }
+        handledWorkplaceCloseMeetingWindow = meetingWindow
+        requestedWorkplaceCloseMeetingWindow = nil
+        return .done
+    }
+
+    var closeButtonRef: CFTypeRef?
+    guard AXUIElementCopyAttributeValue(
+        workplaceWindow,
+        kAXCloseButtonAttribute as CFString,
+        &closeButtonRef
+    ) == .success,
+    let closeButtonRef else {
+        logger.notice("Could not find the Workplace window close button (\(reason, privacy: .public))")
+        return .waiting
+    }
+    let closeButton = closeButtonRef as! AXUIElement
+
+    guard AXUIElementPerformAction(closeButton, kAXPressAction as CFString) == .success else {
+        logger.notice("Failed to close the Workplace window (\(reason, privacy: .public))")
+        return .waiting
+    }
+
+    if !axElement(meetingWindow, isSameAs: requestedWorkplaceCloseMeetingWindow) {
+        requestedWorkplaceCloseMeetingWindow = meetingWindow
+        emit("Meeting started; closing \"\(targetWindowTitle)\"")
+    }
+    return .waiting
 }
 
-/// Inspects the Workplace window and minimizes it, unless a quick second reopen
-/// asks us to snooze. Returns true when this attempt reached a terminal state
-/// (minimized, snoozed, or already minimized) so the retry loop can stop;
-/// returns false when the window isn't present yet and we should keep trying.
-func processWorkplaceWindow(pid: pid_t, reason: String) -> Bool {
-    if isSnoozing() { return true }
+// A single shared retry timer. Zoom can send its window-created event before
+// titles and controls are populated, so retry briefly after each trigger.
+var closeWorkplaceTimer: Timer?
 
-    switch workplaceWindowState(pid: pid) {
-    case .absent:
-        return false
-    case .minimized:
-        pendingMinimize = false   // confirmed minimized
-        return true
-    case .open(let window):
-        let now = Date()
+func scheduleCloseWorkplace(pid: pid_t, reason: String, maxAttempts: Int, interval: TimeInterval) {
+    if closeWorkplaceWindowIfMeetingStarted(pid: pid, reason: reason) == .done { return }
+    if closeWorkplaceTimer?.isValid == true { return }
 
-        // If our own previous minimize hasn't applied yet, this `.open` is that
-        // window still settling — not a user reopen. Re-issue and wait; don't let
-        // a single physical reopen get double-counted into a snooze.
-        let reissuingPendingMinimize = pendingMinimize
-
-        if !reissuingPendingMinimize,
-           hasMinimizedThisSession,
-           let last = lastReopenAt,
-           now.timeIntervalSince(last) < reopenDoubleTapWindow {
-            beginSnooze(pid: pid)
-            return true
+    logger.debug("Scheduling close retries (\(reason, privacy: .public))")
+    var attempts = 0
+    closeWorkplaceTimer = Timer.scheduledTimer(withTimeInterval: interval, repeats: true) { timer in
+        attempts += 1
+        let result = closeWorkplaceWindowIfMeetingStarted(pid: pid, reason: reason)
+        if result == .done || attempts >= maxAttempts {
+            if attempts >= maxAttempts && result == .waiting {
+                emit("Could not close \"\(targetWindowTitle)\" after \(attempts) attempts")
+            }
+            timer.invalidate()
+            closeWorkplaceTimer = nil
         }
+    }
+}
 
-        guard AXUIElementSetAttributeValue(window, kAXMinimizedAttribute as CFString, kCFBooleanTrue) == .success else {
-            logger.notice("Failed to minimize (\(reason, privacy: .public))")
-            return false
+// MARK: - Workplace reopen handling
+
+enum ReopenWorkplaceAttempt {
+    case done
+    case waiting
+    case zoomNotRunning
+}
+
+var reopenWorkplaceRequested = false
+var reopenWorkplaceTimer: Timer?
+
+func reopenWorkplaceIfMeetingEnded(pid: pid_t) -> ReopenWorkplaceAttempt {
+    guard let zoom = zoomApplication(),
+          !zoom.isTerminated,
+          zoom.processIdentifier == pid else {
+        reopenWorkplaceRequested = false
+        return .zoomNotRunning
+    }
+
+    let (error, windows) = copyZoomWindows(pid: pid)
+    guard error == .success else { return .waiting }
+
+    let meetingStillOpen = windows.contains { window in
+        guard let title = axString(window, kAXTitleAttribute as String) else { return false }
+        return meetingWindowTitles.contains(title)
+    }
+    if meetingStillOpen { return .waiting }
+
+    if windows.contains(where: {
+        axString($0, kAXTitleAttribute as String) == targetWindowTitle
+    }) {
+        if reopenWorkplaceRequested {
+            emit("Meeting ended; reopened \"\(targetWindowTitle)\"")
         }
+        reopenWorkplaceRequested = false
+        return .done
+    }
 
-        // Confirm whether the minimize took effect synchronously.
-        if case .minimized = workplaceWindowState(pid: pid) {
-            pendingMinimize = false
-        } else {
-            pendingMinimize = true
-        }
+    guard !reopenWorkplaceRequested else { return .waiting }
+    guard let zoomURL = NSWorkspace.shared.urlForApplication(
+        withBundleIdentifier: zoomBundleID
+    ) else {
+        emit("Meeting ended; could not find the Zoom application")
+        return .done
+    }
 
-        // Only classify a real, newly-observed open — not a re-issue of a minimize
-        // that simply hadn't applied yet.
-        if !reissuingPendingMinimize {
-            if hasMinimizedThisSession {
-                lastReopenAt = now   // a genuine reopen; arms the double-tap window
-                emit("Re-minimized \"\(targetWindowTitle)\" (reopen)")
-            } else {
-                hasMinimizedThisSession = true
-                emit("Minimized \"\(targetWindowTitle)\"")
+    reopenWorkplaceRequested = true
+    emit("Meeting ended; reopening \"\(targetWindowTitle)\"")
+
+    let configuration = NSWorkspace.OpenConfiguration()
+    configuration.activates = true
+    configuration.addsToRecentItems = false
+    NSWorkspace.shared.openApplication(
+        at: zoomURL,
+        configuration: configuration
+    ) { _, error in
+        if let error {
+            DispatchQueue.main.async {
+                reopenWorkplaceRequested = false
+                logger.notice("Failed to ask Zoom to reopen (\(error.localizedDescription, privacy: .public))")
             }
         }
-        return true
     }
+    return .waiting
 }
 
-// A single shared retry timer. The Workplace window often isn't present the
-// instant an event fires, so we try immediately and then poll briefly. The
-// debounce prevents overlapping events from stacking timers.
-var minimizeTimer: Timer?
+func scheduleReopenWorkplaceAfterMeeting(
+    pid: pid_t,
+    maxAttempts: Int = 20,
+    interval: TimeInterval = 0.5
+) {
+    if reopenWorkplaceTimer?.isValid == true { return }
 
-func scheduleMinimize(pid: pid_t, reason: String, maxAttempts: Int, interval: TimeInterval) {
-    if processWorkplaceWindow(pid: pid, reason: reason) { return }
-    if minimizeTimer?.isValid == true { return }
-
-    logger.debug("Scheduling minimize retries (\(reason, privacy: .public))")
     var attempts = 0
-    minimizeTimer = Timer.scheduledTimer(withTimeInterval: interval, repeats: true) { timer in
+    reopenWorkplaceTimer = Timer.scheduledTimer(withTimeInterval: interval, repeats: true) { timer in
         attempts += 1
-        if processWorkplaceWindow(pid: pid, reason: reason) || attempts >= maxAttempts {
+        let result = reopenWorkplaceIfMeetingEnded(pid: pid)
+        if result == .done || result == .zoomNotRunning || attempts >= maxAttempts {
+            if attempts >= maxAttempts && result == .waiting {
+                emit("Meeting ended; could not reopen \"\(targetWindowTitle)\"")
+            }
             timer.invalidate()
-            minimizeTimer = nil
+            reopenWorkplaceTimer = nil
         }
     }
 }
@@ -433,20 +465,37 @@ func scheduleDisableChatPreviews(
 
 // MARK: - AX window observer
 
-// Catches the Workplace window reappearing (reopened from the Dock, or restored
-// by Zoom when a meeting ends) without polling. Retained for the process'
-// lifetime; re-registered whenever Zoom relaunches with a new pid.
+// Catches meeting-window creation without continuous polling. Retained for the
+// process' lifetime; re-registered whenever Zoom relaunches with a new pid.
 var axObserver: AXObserver?
 var observedPID: pid_t = 0
+var observedMeetingEndWindow: AXUIElement?
 
-// All application-level notifications (reliably delivered when registered on the
-// app element). kAXFocusedWindowChangedNotification covers the Workplace window
-// being restored from the Dock, since restoring a window focuses it.
+// All application-level notifications (reliably delivered when registered on
+// the app element). Creation/focus/activation can each expose the meeting after
+// a slightly different stage of Zoom's window setup.
 let observedNotifications: [CFString] = [
     kAXWindowCreatedNotification as CFString,
     kAXFocusedWindowChangedNotification as CFString,
     kAXApplicationActivatedNotification as CFString,
 ]
+
+func observeMeetingEnd(for meetingWindow: AXUIElement) {
+    if axElement(meetingWindow, isSameAs: observedMeetingEndWindow) { return }
+    guard let observer = axObserver else { return }
+
+    let error = AXObserverAddNotification(
+        observer,
+        meetingWindow,
+        kAXUIElementDestroyedNotification as CFString,
+        nil
+    )
+    if error == .success || error == .notificationAlreadyRegistered {
+        observedMeetingEndWindow = meetingWindow
+    } else {
+        logger.notice("Could not observe meeting end (AXError: \(error.rawValue, privacy: .public))")
+    }
+}
 
 func axObserverCallback(
     _ observer: AXObserver,
@@ -456,7 +505,26 @@ func axObserverCallback(
 ) {
     guard observedPID != 0 else { return }
     logger.debug("AX event: \(notification as String, privacy: .public)")
-    scheduleMinimize(pid: observedPID, reason: "ax:\(notification as String)", maxAttempts: 8, interval: 0.4)
+
+    if CFEqual(notification, kAXUIElementDestroyedNotification as CFString) {
+        observedMeetingEndWindow = nil
+        scheduleReopenWorkplaceAfterMeeting(pid: observedPID)
+        return
+    }
+
+    // Some Zoom versions focus another window before destroying the meeting
+    // window. Treat the disappearance of its exact title as the same transition.
+    if observedMeetingEndWindow != nil, meetingWindow(pid: observedPID) == nil {
+        observedMeetingEndWindow = nil
+        scheduleReopenWorkplaceAfterMeeting(pid: observedPID)
+    }
+
+    scheduleCloseWorkplace(
+        pid: observedPID,
+        reason: "ax:\(notification as String)",
+        maxAttempts: 20,
+        interval: 0.4
+    )
     scheduleDisableChatPreviews(
         pid: observedPID,
         reason: "ax:\(notification as String)",
@@ -469,6 +537,7 @@ func registerAXObserver(pid: pid_t) {
     if let existing = axObserver {
         CFRunLoopRemoveSource(CFRunLoopGetMain(), AXObserverGetRunLoopSource(existing), .defaultMode)
         axObserver = nil
+        observedMeetingEndWindow = nil
     }
 
     var observer: AXObserver?
@@ -508,10 +577,9 @@ func installDiagnosticSignalHandler() {
 }
 
 func handleZoom(pid: pid_t, reason: String) {
-    resetSessionState()   // a (re)launched Zoom is a fresh session: clear snooze/reopen tracking
     dumpZoomWindows(reason: reason)
     registerAXObserver(pid: pid)
-    scheduleMinimize(pid: pid, reason: reason, maxAttempts: 30, interval: 1.0)
+    scheduleCloseWorkplace(pid: pid, reason: reason, maxAttempts: 45, interval: 1.0)
     scheduleDisableChatPreviews(pid: pid, reason: reason, maxAttempts: 45, interval: 1.0)
 }
 
@@ -526,12 +594,26 @@ func startWatching() {
         handleZoom(pid: app.processIdentifier, reason: "launch")
     }
 
-    // Zoom brought to the front (Dock click, Cmd-Tab) — the Workplace window may
-    // have just been restored.
+    center.addObserver(forName: NSWorkspace.didTerminateApplicationNotification, object: nil, queue: .main) { note in
+        guard let app = note.userInfo?[NSWorkspace.applicationUserInfoKey] as? NSRunningApplication,
+              app.bundleIdentifier == zoomBundleID else { return }
+        reopenWorkplaceTimer?.invalidate()
+        reopenWorkplaceTimer = nil
+        reopenWorkplaceRequested = false
+        observedMeetingEndWindow = nil
+    }
+
+    // Zoom brought to the front — a newly created meeting window may now have
+    // its final title and controls.
     center.addObserver(forName: NSWorkspace.didActivateApplicationNotification, object: nil, queue: .main) { note in
         guard let app = note.userInfo?[NSWorkspace.applicationUserInfoKey] as? NSRunningApplication,
               app.bundleIdentifier == zoomBundleID else { return }
-        scheduleMinimize(pid: app.processIdentifier, reason: "activate", maxAttempts: 8, interval: 0.4)
+        scheduleCloseWorkplace(
+            pid: app.processIdentifier,
+            reason: "activate",
+            maxAttempts: 12,
+            interval: 0.4
+        )
         scheduleDisableChatPreviews(
             pid: app.processIdentifier,
             reason: "activate",

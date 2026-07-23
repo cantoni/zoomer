@@ -1,16 +1,15 @@
 # ZoomStupidWorkplaceAutominimizer
 
-A tiny macOS LaunchAgent that automatically minimizes the **Zoom Workplace**
-window whenever Zoom launches. Meeting windows are left alone — only the window
-titled exactly `Zoom Workplace` is minimized. When a meeting or webinar starts,
-the agent also turns off Zoom's **Show chat previews** option for that session.
+A tiny macOS LaunchAgent that automatically closes the **Zoom Workplace**
+window when a meeting or webinar starts. The meeting window is left alone. The
+Workplace window is reopened when the meeting ends. The agent also turns off
+Zoom's **Show chat previews** option for that session.
 
 It is event-driven (no polling loop): it watches Zoom launch, activation, and
-window events via `NSWorkspace` and an `AXObserver`, and minimizes the window
-through the Accessibility API. It uses that same API to inspect Zoom's
-in-meeting chat preview checkbox and toggles it only when it is enabled. Because
-it reacts to window events, it keeps the Workplace window minimized if you reopen it
-(e.g. from the Dock) or Zoom restores it when a meeting ends.
+window events via `NSWorkspace` and an `AXObserver`. When it sees an exact
+`Zoom Meeting` or `Zoom Webinar` window, it closes the window titled exactly
+`Zoom Workplace` through the Accessibility API. It uses that same API to inspect
+Zoom's in-meeting chat preview checkbox and toggles it only when it is enabled.
 
 > Status: **beta**. Built for personal use; English window titles only.
 
@@ -49,7 +48,7 @@ Verify everything is healthy:
 ```
 
 You want to see `accessibility: granted` and a running LaunchAgent. Then launch
-Zoom; the Workplace window should minimize on its own.
+Zoom and start a meeting; the Workplace window should close on its own.
 
 ## Commands
 
@@ -86,7 +85,7 @@ the variable.
 
 ## Troubleshooting
 
-**`--status` says NOT granted, but the window still gets minimized.**
+**`--status` says NOT granted, but the window still gets closed.**
 That's expected and not a bug. When you run the binary from a terminal,
 `AXIsProcessTrusted()` reflects the *terminal's* Accessibility grant (the terminal
 is the "responsible process" for tools it launches), not the installed binary's.
@@ -132,15 +131,14 @@ window titles aren't exposed there.
 
 ## Behavior notes
 
-- The Workplace window is kept minimized **whenever it appears** — including if you
-  reopen it from the Dock. That's intentional (the window is treated as useless).
-- **Snooze:** if you want the window to stay open, **reopen it a second time within
-  5 seconds** of the first reopen. That suspends auto-minimizing for 15 minutes;
-  afterwards it resumes and minimizes the window again. (Quitting/relaunching Zoom
-  also clears the snooze.) Tune `reopenDoubleTapWindow` / `snoozeDuration` in
-  `Sources/main.swift`.
-- Only the window titled exactly `Zoom Workplace` is ever touched. The meeting
-  window (`Zoom Meeting`) is never minimized.
+- The Workplace window is closed once when each meeting or webinar starts. It is
+  not closed merely because Zoom launches, and reopening it during the meeting
+  leaves it open.
+- When the meeting or webinar ends, the agent asks Zoom to reopen the Workplace
+  window. It does nothing if Zoom already reopened it, and it does not relaunch
+  Zoom if the application itself was quit.
+- Only the window titled exactly `Zoom Workplace` is ever closed. The meeting
+  and webinar windows are never closed.
 - Zoom does not persist **Show chat previews** between meetings, so the agent
   turns it off once for each new meeting or webinar. If it is already off, the
   agent leaves it off.
