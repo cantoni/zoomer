@@ -84,6 +84,30 @@ daemon_pid() {
         awk '/[^a-z]pid =/{print $3; exit}' || true
 }
 
+service_loaded() {
+    launchctl print "gui/$(id -u)/$IDENTIFIER" >/dev/null 2>&1
+}
+
+unload_agent() {
+    if ! service_loaded; then
+        return 0
+    fi
+
+    launchctl bootout "gui/$(id -u)/$IDENTIFIER"
+
+    # launchd can return from bootout before the job has fully left its domain.
+    # Bootstrapping the replacement during that gap fails with an opaque error 5.
+    local attempts=0
+    while service_loaded; do
+        attempts=$((attempts + 1))
+        if [ "$attempts" -ge 50 ]; then
+            echo "Timed out waiting for the existing LaunchAgent to stop." >&2
+            return 1
+        fi
+        sleep 0.1
+    done
+}
+
 print_configuration() {
     echo "Configuration:"
     echo "  Workplace window:   ${WORKPLACE_MODE}"
@@ -149,8 +173,7 @@ case "${1:-install}" in
         printf '%s\n' "$IDENTIFIER" > "$STATE_FILE"
         save_configuration
 
-        # Reload (ignore errors if not already loaded).
-        launchctl bootout "gui/$(id -u)/$IDENTIFIER" 2>/dev/null || true
+        unload_agent
         launchctl bootstrap "gui/$(id -u)" "$PLIST_DST"
 
         echo ""
@@ -290,7 +313,7 @@ case "${1:-install}" in
             set_plist_environment_value "ZWAM_WORKPLACE_MODE" "$WORKPLACE_MODE"
             set_plist_environment_value "ZWAM_SHOW_CHAT_PREVIEWS" "$SHOW_CHAT_PREVIEWS"
             if [ -n "$RUNNING_PID" ]; then
-                launchctl bootout "gui/$(id -u)/$IDENTIFIER" 2>/dev/null || true
+                unload_agent
                 launchctl bootstrap "gui/$(id -u)" "$PLIST_DST"
                 echo "Restarted the agent with the new configuration."
             else
@@ -327,8 +350,7 @@ case "${1:-install}" in
         fi
         echo "Stopping ${BINARY_NAME}…"
         # bootout, not kill: with KeepAlive the LaunchAgent would otherwise just respawn.
-        launchctl bootout "gui/$(id -u)/$IDENTIFIER" 2>/dev/null || true
-        sleep 0.3
+        unload_agent
         if [ -z "$(daemon_pid)" ]; then
             echo "Stopped. Starts again at next login; run './install.sh start' to start it now."
         else
@@ -360,7 +382,7 @@ case "${1:-install}" in
 
     uninstall)
         echo "Stopping and removing LaunchAgent…"
-        launchctl bootout "gui/$(id -u)/$IDENTIFIER" 2>/dev/null || true
+        unload_agent
         rm -f "$PLIST_DST"
 
         echo "Removing binary…"
