@@ -12,6 +12,44 @@ let targetWindowTitle = "Zoom Workplace"
 let meetingWindowTitles = ["Zoom Meeting", "Zoom Webinar"]
 let chatPreviewCheckboxLabel = "Show chat previews"
 
+// MARK: - Configuration
+
+enum WorkplaceMode: String {
+    case closeDuringMeetings = "close-during-meetings"
+    case minimizeDuringMeetings = "minimize-during-meetings"
+    case minimizeAlways = "minimize-always"
+    case leaveAlone = "leave-alone"
+
+    var description: String {
+        switch self {
+        case .closeDuringMeetings: return "close during meetings"
+        case .minimizeDuringMeetings: return "minimize during meetings"
+        case .minimizeAlways: return "minimize always"
+        case .leaveAlone: return "leave alone"
+        }
+    }
+}
+
+struct Settings {
+    let workplaceMode: WorkplaceMode
+    let showChatPreviews: Bool
+}
+
+func loadSettings() -> Settings {
+    let environment = ProcessInfo.processInfo.environment
+    let mode = WorkplaceMode(
+        rawValue: environment["ZWAM_WORKPLACE_MODE"] ?? ""
+    ) ?? .closeDuringMeetings
+    let showChatPreviews = environment["ZWAM_SHOW_CHAT_PREVIEWS"]?
+        .caseInsensitiveCompare("yes") == .orderedSame
+    return Settings(
+        workplaceMode: mode,
+        showChatPreviews: showChatPreviews
+    )
+}
+
+let settings = loadSettings()
+
 // MARK: - Accessibility helpers
 
 func axString(_ element: AXUIElement, _ attribute: String) -> String? {
@@ -272,6 +310,162 @@ func scheduleCloseWorkplace(pid: pid_t, reason: String, maxAttempts: Int, interv
     }
 }
 
+// MARK: - Workplace minimize handling
+
+enum MinimizeWorkplaceAttempt {
+    case done
+    case waiting
+    case noMeeting
+}
+
+var handledWorkplaceMinimizeMeetingWindow: AXUIElement?
+var minimizeWorkplaceDuringMeetingTimer: Timer?
+var minimizeWorkplaceAlwaysTimer: Timer?
+
+enum SetWorkplaceMinimizedOutcome {
+    case absent
+    case unchanged
+    case changed
+    case failed
+}
+
+func setWorkplaceMinimized(
+    in windows: [AXUIElement],
+    minimized: Bool,
+    reason: String
+) -> SetWorkplaceMinimizedOutcome {
+    guard let workplaceWindow = windows.first(where: {
+        axString($0, kAXTitleAttribute as String) == targetWindowTitle
+    }) else {
+        return .absent
+    }
+
+    if axBool(workplaceWindow, kAXMinimizedAttribute as String) == minimized {
+        return .unchanged
+    }
+
+    let value = (minimized ? kCFBooleanTrue : kCFBooleanFalse)!
+    guard AXUIElementSetAttributeValue(
+        workplaceWindow,
+        kAXMinimizedAttribute as CFString,
+        value
+    ) == .success else {
+        let action = minimized ? "minimize" : "restore"
+        logger.notice("Failed to \(action, privacy: .public) the Workplace window (\(reason, privacy: .public))")
+        return .failed
+    }
+    return .changed
+}
+
+func minimizeWorkplaceIfMeetingStarted(
+    pid: pid_t,
+    reason: String
+) -> MinimizeWorkplaceAttempt {
+    let (error, windows) = copyZoomWindows(pid: pid)
+    guard error == .success else {
+        logger.notice("Could not read windows (AXError: \(error.rawValue, privacy: .public))")
+        return .waiting
+    }
+    guard let meetingWindow = windows.first(where: { window in
+        guard let title = axString(window, kAXTitleAttribute as String) else { return false }
+        return meetingWindowTitles.contains(title)
+    }) else {
+        handledWorkplaceMinimizeMeetingWindow = nil
+        return .noMeeting
+    }
+
+    observeMeetingEnd(for: meetingWindow)
+
+    if axElement(meetingWindow, isSameAs: handledWorkplaceMinimizeMeetingWindow) {
+        return .done
+    }
+
+    switch setWorkplaceMinimized(
+        in: windows,
+        minimized: true,
+        reason: reason
+    ) {
+    case .absent, .unchanged:
+        handledWorkplaceMinimizeMeetingWindow = meetingWindow
+        return .done
+    case .changed:
+        handledWorkplaceMinimizeMeetingWindow = meetingWindow
+        emit("Meeting started; minimized \"\(targetWindowTitle)\"")
+        return .done
+    case .failed:
+        return .waiting
+    }
+}
+
+func scheduleMinimizeWorkplaceDuringMeeting(
+    pid: pid_t,
+    reason: String,
+    maxAttempts: Int,
+    interval: TimeInterval
+) {
+    if minimizeWorkplaceIfMeetingStarted(pid: pid, reason: reason) == .done { return }
+    if minimizeWorkplaceDuringMeetingTimer?.isValid == true { return }
+
+    var attempts = 0
+    minimizeWorkplaceDuringMeetingTimer = Timer.scheduledTimer(
+        withTimeInterval: interval,
+        repeats: true
+    ) { timer in
+        attempts += 1
+        let result = minimizeWorkplaceIfMeetingStarted(pid: pid, reason: reason)
+        if result == .done || attempts >= maxAttempts {
+            if attempts >= maxAttempts && result == .waiting {
+                emit("Could not minimize \"\(targetWindowTitle)\" after \(attempts) attempts")
+            }
+            timer.invalidate()
+            minimizeWorkplaceDuringMeetingTimer = nil
+        }
+    }
+}
+
+func minimizeWorkplace(pid: pid_t, reason: String) -> Bool {
+    let (error, windows) = copyZoomWindows(pid: pid)
+    guard error == .success else {
+        logger.notice("Could not read windows (AXError: \(error.rawValue, privacy: .public))")
+        return false
+    }
+    switch setWorkplaceMinimized(
+        in: windows,
+        minimized: true,
+        reason: reason
+    ) {
+    case .absent, .failed:
+        return false
+    case .unchanged:
+        return true
+    case .changed:
+        emit("Minimized \"\(targetWindowTitle)\"")
+        return true
+    }
+}
+
+func scheduleMinimizeWorkplaceAlways(
+    pid: pid_t,
+    reason: String,
+    maxAttempts: Int,
+    interval: TimeInterval
+) {
+    if minimizeWorkplace(pid: pid, reason: reason) { return }
+    if minimizeWorkplaceAlwaysTimer?.isValid == true { return }
+
+    var attempts = 0
+    minimizeWorkplaceAlwaysTimer = Timer.scheduledTimer(
+        withTimeInterval: interval,
+        repeats: true
+    ) { timer in
+        attempts += 1
+        if minimizeWorkplace(pid: pid, reason: reason) || attempts >= maxAttempts {
+            timer.invalidate()
+            minimizeWorkplaceAlwaysTimer = nil
+        }
+    }
+}
+
 // MARK: - Workplace reopen handling
 
 enum ReopenWorkplaceAttempt {
@@ -355,6 +549,78 @@ func scheduleReopenWorkplaceAfterMeeting(
             }
             timer.invalidate()
             reopenWorkplaceTimer = nil
+        }
+    }
+}
+
+enum RestoreMinimizedWorkplaceAttempt {
+    case done
+    case waiting
+    case zoomNotRunning
+}
+
+var restoreMinimizedWorkplaceTimer: Timer?
+
+func restoreMinimizedWorkplaceIfMeetingEnded(
+    pid: pid_t
+) -> RestoreMinimizedWorkplaceAttempt {
+    guard let zoom = zoomApplication(),
+          !zoom.isTerminated,
+          zoom.processIdentifier == pid else {
+        return .zoomNotRunning
+    }
+
+    let (error, windows) = copyZoomWindows(pid: pid)
+    guard error == .success else { return .waiting }
+
+    let meetingStillOpen = windows.contains { window in
+        guard let title = axString(window, kAXTitleAttribute as String) else { return false }
+        return meetingWindowTitles.contains(title)
+    }
+    if meetingStillOpen { return .waiting }
+
+    guard let workplaceWindow = windows.first(where: {
+        axString($0, kAXTitleAttribute as String) == targetWindowTitle
+    }) else {
+        return .waiting
+    }
+
+    if axBool(workplaceWindow, kAXMinimizedAttribute as String) != true {
+        return .done
+    }
+
+    guard AXUIElementSetAttributeValue(
+        workplaceWindow,
+        kAXMinimizedAttribute as CFString,
+        kCFBooleanFalse
+    ) == .success else {
+        return .waiting
+    }
+
+    emit("Meeting ended; restored \"\(targetWindowTitle)\"")
+    return .done
+}
+
+func scheduleRestoreMinimizedWorkplaceAfterMeeting(
+    pid: pid_t,
+    maxAttempts: Int = 20,
+    interval: TimeInterval = 0.5
+) {
+    if restoreMinimizedWorkplaceTimer?.isValid == true { return }
+
+    var attempts = 0
+    restoreMinimizedWorkplaceTimer = Timer.scheduledTimer(
+        withTimeInterval: interval,
+        repeats: true
+    ) { timer in
+        attempts += 1
+        let result = restoreMinimizedWorkplaceIfMeetingEnded(pid: pid)
+        if result == .done || result == .zoomNotRunning || attempts >= maxAttempts {
+            if attempts >= maxAttempts && result == .waiting {
+                emit("Meeting ended; could not restore \"\(targetWindowTitle)\"")
+            }
+            timer.invalidate()
+            restoreMinimizedWorkplaceTimer = nil
         }
     }
 }
@@ -497,6 +763,65 @@ func observeMeetingEnd(for meetingWindow: AXUIElement) {
     }
 }
 
+func scheduleConfiguredWorkplaceAction(
+    pid: pid_t,
+    reason: String,
+    maxAttempts: Int,
+    interval: TimeInterval
+) {
+    switch settings.workplaceMode {
+    case .closeDuringMeetings:
+        scheduleCloseWorkplace(
+            pid: pid,
+            reason: reason,
+            maxAttempts: maxAttempts,
+            interval: interval
+        )
+    case .minimizeDuringMeetings:
+        scheduleMinimizeWorkplaceDuringMeeting(
+            pid: pid,
+            reason: reason,
+            maxAttempts: maxAttempts,
+            interval: interval
+        )
+    case .minimizeAlways:
+        scheduleMinimizeWorkplaceAlways(
+            pid: pid,
+            reason: reason,
+            maxAttempts: maxAttempts,
+            interval: interval
+        )
+    case .leaveAlone:
+        break
+    }
+}
+
+func scheduleConfiguredChatPreviewAction(
+    pid: pid_t,
+    reason: String,
+    maxAttempts: Int,
+    interval: TimeInterval
+) {
+    guard !settings.showChatPreviews else { return }
+    scheduleDisableChatPreviews(
+        pid: pid,
+        reason: reason,
+        maxAttempts: maxAttempts,
+        interval: interval
+    )
+}
+
+func scheduleConfiguredMeetingEndAction(pid: pid_t) {
+    switch settings.workplaceMode {
+    case .closeDuringMeetings:
+        scheduleReopenWorkplaceAfterMeeting(pid: pid)
+    case .minimizeDuringMeetings:
+        scheduleRestoreMinimizedWorkplaceAfterMeeting(pid: pid)
+    case .minimizeAlways, .leaveAlone:
+        break
+    }
+}
+
 func axObserverCallback(
     _ observer: AXObserver,
     _ element: AXUIElement,
@@ -508,7 +833,7 @@ func axObserverCallback(
 
     if CFEqual(notification, kAXUIElementDestroyedNotification as CFString) {
         observedMeetingEndWindow = nil
-        scheduleReopenWorkplaceAfterMeeting(pid: observedPID)
+        scheduleConfiguredMeetingEndAction(pid: observedPID)
         return
     }
 
@@ -516,16 +841,16 @@ func axObserverCallback(
     // window. Treat the disappearance of its exact title as the same transition.
     if observedMeetingEndWindow != nil, meetingWindow(pid: observedPID) == nil {
         observedMeetingEndWindow = nil
-        scheduleReopenWorkplaceAfterMeeting(pid: observedPID)
+        scheduleConfiguredMeetingEndAction(pid: observedPID)
     }
 
-    scheduleCloseWorkplace(
+    scheduleConfiguredWorkplaceAction(
         pid: observedPID,
         reason: "ax:\(notification as String)",
         maxAttempts: 20,
         interval: 0.4
     )
-    scheduleDisableChatPreviews(
+    scheduleConfiguredChatPreviewAction(
         pid: observedPID,
         reason: "ax:\(notification as String)",
         maxAttempts: 20,
@@ -579,8 +904,18 @@ func installDiagnosticSignalHandler() {
 func handleZoom(pid: pid_t, reason: String) {
     dumpZoomWindows(reason: reason)
     registerAXObserver(pid: pid)
-    scheduleCloseWorkplace(pid: pid, reason: reason, maxAttempts: 45, interval: 1.0)
-    scheduleDisableChatPreviews(pid: pid, reason: reason, maxAttempts: 45, interval: 1.0)
+    scheduleConfiguredWorkplaceAction(
+        pid: pid,
+        reason: reason,
+        maxAttempts: 45,
+        interval: 1.0
+    )
+    scheduleConfiguredChatPreviewAction(
+        pid: pid,
+        reason: reason,
+        maxAttempts: 45,
+        interval: 1.0
+    )
 }
 
 func startWatching() {
@@ -600,6 +935,12 @@ func startWatching() {
         reopenWorkplaceTimer?.invalidate()
         reopenWorkplaceTimer = nil
         reopenWorkplaceRequested = false
+        restoreMinimizedWorkplaceTimer?.invalidate()
+        restoreMinimizedWorkplaceTimer = nil
+        minimizeWorkplaceDuringMeetingTimer?.invalidate()
+        minimizeWorkplaceDuringMeetingTimer = nil
+        minimizeWorkplaceAlwaysTimer?.invalidate()
+        minimizeWorkplaceAlwaysTimer = nil
         observedMeetingEndWindow = nil
     }
 
@@ -608,13 +949,13 @@ func startWatching() {
     center.addObserver(forName: NSWorkspace.didActivateApplicationNotification, object: nil, queue: .main) { note in
         guard let app = note.userInfo?[NSWorkspace.applicationUserInfoKey] as? NSRunningApplication,
               app.bundleIdentifier == zoomBundleID else { return }
-        scheduleCloseWorkplace(
+        scheduleConfiguredWorkplaceAction(
             pid: app.processIdentifier,
             reason: "activate",
             maxAttempts: 12,
             interval: 0.4
         )
-        scheduleDisableChatPreviews(
+        scheduleConfiguredChatPreviewAction(
             pid: app.processIdentifier,
             reason: "activate",
             maxAttempts: 12,
@@ -628,6 +969,10 @@ func startWatching() {
         handleZoom(pid: zoomApp.processIdentifier, reason: "startup-scan")
     }
 
+    emit(
+        "Configuration: workplace=\(settings.workplaceMode.rawValue), "
+            + "show-chat-previews=\(settings.showChatPreviews ? "yes" : "no")"
+    )
     emit("Watching for Zoom (launch + activate + window events); SIGUSR1 dumps windows")
 }
 
@@ -646,6 +991,8 @@ func printStatus() {
     print("  executable:    \(resolvedExecutablePath())")
     print("  accessibility: \(trusted ? "granted" : "NOT granted")")
     print("  zoom running:  \(zoomRunning ? "yes" : "no")")
+    print("  workplace:     \(settings.workplaceMode.description)")
+    print("  chat previews: \(settings.showChatPreviews ? "yes" : "no")")
     print("  note: run from a terminal, 'accessibility' reflects the terminal's")
     print("        grant, not this binary's. The launchd daemon is authoritative;")
     print("        use './install.sh status' to read the daemon's real state.")

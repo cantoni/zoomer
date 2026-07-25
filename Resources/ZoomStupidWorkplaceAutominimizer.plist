@@ -18,6 +18,10 @@
     <dict>
         <key>ZWAM_BUNDLE_ID</key>
         <string>com.example.ZoomStupidWorkplaceAutominimizer</string>
+        <key>ZWAM_WORKPLACE_MODE</key>
+        <string>close-during-meetings</string>
+        <key>ZWAM_SHOW_CHAT_PREVIEWS</key>
+        <string>no</string>
     </dict>
 
     <key>RunAtLoad</key>
