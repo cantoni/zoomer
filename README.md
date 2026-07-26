@@ -1,15 +1,16 @@
 # ZoomStupidWorkplaceAutominimizer
 
-A tiny macOS LaunchAgent that automatically closes the **Zoom Workplace**
-window when a meeting or webinar starts. The meeting window is left alone. The
-Workplace window is reopened when the meeting ends. The agent also turns off
-Zoom's **Show chat previews** option for that session.
+A tiny configurable macOS LaunchAgent that manages the **Zoom Workplace**
+window and Zoom's **Show chat previews** option. By default, the Workplace
+window closes when a meeting or webinar starts and reopens when it ends, and
+chat previews are turned off for that session. The meeting window is left alone.
 
 It is event-driven (no polling loop): it watches Zoom launch, activation, and
 window events via `NSWorkspace` and an `AXObserver`. When it sees an exact
-`Zoom Meeting` or `Zoom Webinar` window, it closes the window titled exactly
-`Zoom Workplace` through the Accessibility API. It uses that same API to inspect
-Zoom's in-meeting chat preview checkbox and toggles it only when it is enabled.
+`Zoom Meeting` or `Zoom Webinar` window, it applies the configured behavior to
+the window titled exactly `Zoom Workplace` through the Accessibility API. When
+chat previews are configured off, it uses that same API to toggle Zoom's
+in-meeting checkbox only when it is enabled.
 
 > Status: **beta**. Built for personal use; English window titles only.
 
@@ -27,9 +28,11 @@ Zoom's in-meeting chat preview checkbox and toggles it only when it is enabled.
 ```
 
 This builds the binary, code-signs it, installs it to `~/.local/bin` (no `sudo`
-needed), and loads a LaunchAgent so it starts at login and stays running. The
-installer then opens **System Settings ▸ Privacy & Security ▸ Accessibility** and
-reveals the binary in Finder.
+needed), and loads a LaunchAgent so it starts at login and stays running. Before
+building, an interactive install runs a two-question configuration wizard.
+Pressing Enter accepts the shown default or previously saved choice. The
+installer then opens **System Settings ▸ Privacy & Security ▸ Accessibility**
+and reveals the binary in Finder.
 
 **Grant Accessibility access** to:
 
@@ -55,6 +58,7 @@ Zoom and start a meeting; the Workplace window should close on its own.
 | Command | What it does |
 | --- | --- |
 | `./install.sh install` | Build, sign, install, load the agent, open the grant UI |
+| `./install.sh configure` | Choose the Workplace and chat-preview behaviors |
 | `./install.sh quit` | Stop the running agent (it restarts at next login) |
 | `./install.sh start` | Start the installed agent again (no rebuild, keeps the grant) |
 | `./install.sh status` | Print accessibility status + LaunchAgent state |
@@ -68,6 +72,40 @@ You can also run the binary directly for a one-off check:
 ```sh
 ZoomStupidWorkplaceAutominimizer --status
 ```
+
+## Configuration
+
+An interactive `install` asks both configuration questions before building. To
+change the choices later without rebuilding, run:
+
+```sh
+./install.sh configure
+```
+
+The Workplace window has four modes:
+
+- **Close during meetings** (default): close Workplace when a meeting begins
+  and reopen it when the meeting ends.
+- **Minimize during meetings**: minimize Workplace when a meeting begins and
+  restore it when the meeting ends.
+- **Minimize always**: minimize Workplace whenever it appears or is restored.
+- **Leave alone**: never change the Workplace window.
+
+**Show Chat Previews** can be `yes` or `no` (default). `yes` leaves Zoom's
+existing behavior alone. `no` turns off the checkbox once for each meeting or
+webinar.
+
+For a noninteractive configuration:
+
+```sh
+./install.sh configure \
+  --workplace-mode minimize-during-meetings \
+  --show-chat-previews no
+```
+
+Configuration changes restart a running agent but do not rebuild the binary or
+require Accessibility permission again. The choices are remembered in
+`~/.config/ZoomStupidWorkplaceAutominimizer/`.
 
 ### Using your own bundle id
 
@@ -131,17 +169,19 @@ window titles aren't exposed there.
 
 ## Behavior notes
 
-- The Workplace window is closed once when each meeting or webinar starts. It is
-  not closed merely because Zoom launches, and reopening it during the meeting
-  leaves it open.
-- When the meeting or webinar ends, the agent asks Zoom to reopen the Workplace
-  window. It does nothing if Zoom already reopened it, and it does not relaunch
-  Zoom if the application itself was quit.
-- Only the window titled exactly `Zoom Workplace` is ever closed. The meeting
-  and webinar windows are never closed.
-- Zoom does not persist **Show chat previews** between meetings, so the agent
-  turns it off once for each new meeting or webinar. If it is already off, the
-  agent leaves it off.
+- The two "during meetings" modes act once when each meeting or webinar starts.
+  Reopening or restoring Workplace during the meeting leaves it open.
+- In **Close during meetings**, the agent asks Zoom to reopen Workplace when the
+  meeting ends. It does not relaunch Zoom if the application itself was quit.
+- In **Minimize during meetings**, the agent restores Workplace when the meeting
+  ends.
+- In **Minimize always**, restoring Workplace causes the agent to minimize it
+  again.
+- Only the window titled exactly `Zoom Workplace` is ever closed or minimized.
+  The meeting and webinar windows are never changed.
+- With **Show Chat Previews: no**, the agent turns the option off once for each
+  new meeting or webinar. If it is already off, the agent leaves it off. With
+  `yes`, the agent does nothing to the option.
 - Title matching is exact, so non-English Zoom UIs are not yet handled.
 
 ## Uninstall
