@@ -120,6 +120,59 @@ save_configuration() {
     printf '%s\n' "$SHOW_CHAT_PREVIEWS" > "$CHAT_PREVIEWS_FILE"
 }
 
+prompt_for_configuration() {
+    local mode_choice
+    local chat_choice
+    local current_mode_choice
+    local chat_prompt
+
+    case "$WORKPLACE_MODE" in
+        close-during-meetings)    current_mode_choice=1 ;;
+        minimize-during-meetings) current_mode_choice=2 ;;
+        minimize-always)          current_mode_choice=3 ;;
+        leave-alone)              current_mode_choice=4 ;;
+    esac
+
+    if [ "$SHOW_CHAT_PREVIEWS" = "yes" ]; then
+        chat_prompt="[Y/n]"
+    else
+        chat_prompt="[y/N]"
+    fi
+
+    echo "Configuration wizard"
+    echo ""
+    echo "Workplace window:"
+    echo "  1. Close during meetings (default)"
+    echo "  2. Minimize during meetings"
+    echo "  3. Minimize always"
+    echo "  4. Leave alone"
+    printf "Choose 1-4 [%s]: " "$current_mode_choice"
+    read -r mode_choice
+    case "$mode_choice" in
+        "")  ;;
+        1)   WORKPLACE_MODE="close-during-meetings" ;;
+        2)   WORKPLACE_MODE="minimize-during-meetings" ;;
+        3)   WORKPLACE_MODE="minimize-always" ;;
+        4)   WORKPLACE_MODE="leave-alone" ;;
+        *)
+            echo "Invalid choice: ${mode_choice}" >&2
+            return 1
+            ;;
+    esac
+
+    printf "Show Chat Previews? %s: " "$chat_prompt"
+    read -r chat_choice
+    case "$chat_choice" in
+        "")          ;;
+        y|Y|yes)     SHOW_CHAT_PREVIEWS="yes" ;;
+        n|N|no)      SHOW_CHAT_PREVIEWS="no" ;;
+        *)
+            echo "Show Chat Previews must be 'yes' or 'no'" >&2
+            return 1
+            ;;
+    esac
+}
+
 set_plist_environment_value() {
     local key="$1"
     local value="$2"
@@ -150,6 +203,14 @@ build() {
 
 case "${1:-install}" in
     install)
+        if [ -t 0 ]; then
+            prompt_for_configuration
+            save_configuration
+        else
+            echo "Install configuration:"
+            print_configuration
+        fi
+        echo ""
         build
 
         echo "Installing binary to ${INSTALLED_BINARY}…"
@@ -265,34 +326,18 @@ case "${1:-install}" in
             esac
         done
 
-        if [ -z "$REQUESTED_WORKPLACE_MODE" ]; then
-            echo "Workplace window:"
-            echo "  1. Close during meetings (default)"
-            echo "  2. Minimize during meetings"
-            echo "  3. Minimize always"
-            echo "  4. Leave alone"
-            printf "Choose 1-4 [current: %s]: " "$WORKPLACE_MODE"
-            read -r MODE_CHOICE
-            case "$MODE_CHOICE" in
-                "")  REQUESTED_WORKPLACE_MODE="$WORKPLACE_MODE" ;;
-                1)   REQUESTED_WORKPLACE_MODE="close-during-meetings" ;;
-                2)   REQUESTED_WORKPLACE_MODE="minimize-during-meetings" ;;
-                3)   REQUESTED_WORKPLACE_MODE="minimize-always" ;;
-                4)   REQUESTED_WORKPLACE_MODE="leave-alone" ;;
-                *)   REQUESTED_WORKPLACE_MODE="$MODE_CHOICE" ;;
-            esac
-        fi
-
-        if [ -z "$REQUESTED_SHOW_CHAT_PREVIEWS" ]; then
-            printf "Show Chat Previews? [yes/no, current: %s]: " "$SHOW_CHAT_PREVIEWS"
-            read -r CHAT_CHOICE
-            case "$CHAT_CHOICE" in
-                "")      REQUESTED_SHOW_CHAT_PREVIEWS="$SHOW_CHAT_PREVIEWS" ;;
-                y|Y)     REQUESTED_SHOW_CHAT_PREVIEWS="yes" ;;
-                n|N)     REQUESTED_SHOW_CHAT_PREVIEWS="no" ;;
-                yes|no)  REQUESTED_SHOW_CHAT_PREVIEWS="$CHAT_CHOICE" ;;
-                *)       REQUESTED_SHOW_CHAT_PREVIEWS="$CHAT_CHOICE" ;;
-            esac
+        if [ -z "$REQUESTED_WORKPLACE_MODE" ] \
+            && [ -z "$REQUESTED_SHOW_CHAT_PREVIEWS" ]; then
+            prompt_for_configuration
+            REQUESTED_WORKPLACE_MODE="$WORKPLACE_MODE"
+            REQUESTED_SHOW_CHAT_PREVIEWS="$SHOW_CHAT_PREVIEWS"
+        else
+            if [ -z "$REQUESTED_WORKPLACE_MODE" ]; then
+                REQUESTED_WORKPLACE_MODE="$WORKPLACE_MODE"
+            fi
+            if [ -z "$REQUESTED_SHOW_CHAT_PREVIEWS" ]; then
+                REQUESTED_SHOW_CHAT_PREVIEWS="$SHOW_CHAT_PREVIEWS"
+            fi
         fi
 
         if ! valid_workplace_mode "$REQUESTED_WORKPLACE_MODE"; then

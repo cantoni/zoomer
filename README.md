@@ -28,9 +28,11 @@ in-meeting checkbox only when it is enabled.
 ```
 
 This builds the binary, code-signs it, installs it to `~/.local/bin` (no `sudo`
-needed), and loads a LaunchAgent so it starts at login and stays running. The
-installer then opens **System Settings ▸ Privacy & Security ▸ Accessibility** and
-reveals the binary in Finder.
+needed), and loads a LaunchAgent so it starts at login and stays running. Before
+building, an interactive install runs a two-question configuration wizard.
+Pressing Enter accepts the shown default or previously saved choice. The
+installer then opens **System Settings ▸ Privacy & Security ▸ Accessibility**
+and reveals the binary in Finder.
 
 **Grant Accessibility access** to:
 
@@ -73,7 +75,8 @@ ZoomStupidWorkplaceAutominimizer --status
 
 ## Configuration
 
-Run the interactive configuration:
+An interactive `install` asks both configuration questions before building. To
+change the choices later without rebuilding, run:
 
 ```sh
 ./install.sh configure
