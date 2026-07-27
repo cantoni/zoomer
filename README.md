@@ -171,6 +171,8 @@ window titles aren't exposed there.
 
 - The two "during meetings" modes act once when each meeting or webinar starts.
   Reopening or restoring Workplace during the meeting leaves it open.
+- Zoom's floating screen-sharing controls count as active meeting UI, so
+  starting or stopping a screen share does not reopen or restore Workplace.
 - In **Close during meetings**, the agent asks Zoom to reopen Workplace when the
   meeting ends. It does not relaunch Zoom if the application itself was quit.
 - In **Minimize during meetings**, the agent restores Workplace when the meeting

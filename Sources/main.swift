@@ -11,6 +11,11 @@ let zoomBundleID = "us.zoom.xos"
 let targetWindowTitle = "Zoom Workplace"
 let meetingWindowTitles = ["Zoom Meeting", "Zoom Webinar"]
 let chatPreviewCheckboxLabel = "Show chat previews"
+let screenShareControlLabels = [
+    "Stop Share",
+    "Stop Sharing",
+    "You are screen sharing",
+]
 
 // MARK: - Configuration
 
@@ -132,6 +137,41 @@ func findAXElement(
     return nil
 }
 
+func titledMeetingWindow(in windows: [AXUIElement]) -> AXUIElement? {
+    windows.first { window in
+        guard let title = axString(window, kAXTitleAttribute as String) else {
+            return false
+        }
+        return meetingWindowTitles.contains(title)
+    }
+}
+
+/// With Zoom's default screen-sharing settings, the normal meeting window is
+/// replaced by floating sharing controls. Treat the window containing those
+/// controls as active meeting UI so that transition cannot look like a meeting
+/// ending.
+func screenSharingWindow(in windows: [AXUIElement]) -> AXUIElement? {
+    windows.first { window in
+        screenShareControlLabels.contains { label in
+            findAXElement(
+                below: window,
+                label: label,
+                limit: 2_000
+            ) != nil
+        }
+    }
+}
+
+func activeMeetingWindow(in windows: [AXUIElement]) -> AXUIElement? {
+    titledMeetingWindow(in: windows) ?? screenSharingWindow(in: windows)
+}
+
+func activeMeetingWindow(pid: pid_t) -> AXUIElement? {
+    let (error, windows) = copyZoomWindows(pid: pid)
+    guard error == .success else { return nil }
+    return activeMeetingWindow(in: windows)
+}
+
 func axActionNames(_ element: AXUIElement) -> [String] {
     var names: CFArray?
     guard AXUIElementCopyActionNames(element, &names) == .success else { return [] }
@@ -237,10 +277,7 @@ func closeWorkplaceWindowIfMeetingStarted(pid: pid_t, reason: String) -> CloseWo
         logger.notice("Could not read windows (AXError: \(error.rawValue, privacy: .public))")
         return .waiting
     }
-    guard let meetingWindow = windows.first(where: { window in
-        guard let title = axString(window, kAXTitleAttribute as String) else { return false }
-        return meetingWindowTitles.contains(title)
-    }) else {
+    guard let meetingWindow = titledMeetingWindow(in: windows) else {
         handledWorkplaceCloseMeetingWindow = nil
         requestedWorkplaceCloseMeetingWindow = nil
         return .noMeeting
@@ -366,10 +403,7 @@ func minimizeWorkplaceIfMeetingStarted(
         logger.notice("Could not read windows (AXError: \(error.rawValue, privacy: .public))")
         return .waiting
     }
-    guard let meetingWindow = windows.first(where: { window in
-        guard let title = axString(window, kAXTitleAttribute as String) else { return false }
-        return meetingWindowTitles.contains(title)
-    }) else {
+    guard let meetingWindow = titledMeetingWindow(in: windows) else {
         handledWorkplaceMinimizeMeetingWindow = nil
         return .noMeeting
     }
@@ -471,13 +505,18 @@ func scheduleMinimizeWorkplaceAlways(
 enum ReopenWorkplaceAttempt {
     case done
     case waiting
+    case unconfirmedEnd
+    case meetingActive
     case zoomNotRunning
 }
 
 var reopenWorkplaceRequested = false
 var reopenWorkplaceTimer: Timer?
 
-func reopenWorkplaceIfMeetingEnded(pid: pid_t) -> ReopenWorkplaceAttempt {
+func reopenWorkplaceIfMeetingEnded(
+    pid: pid_t,
+    meetingEndConfirmed: Bool
+) -> ReopenWorkplaceAttempt {
     guard let zoom = zoomApplication(),
           !zoom.isTerminated,
           zoom.processIdentifier == pid else {
@@ -488,11 +527,10 @@ func reopenWorkplaceIfMeetingEnded(pid: pid_t) -> ReopenWorkplaceAttempt {
     let (error, windows) = copyZoomWindows(pid: pid)
     guard error == .success else { return .waiting }
 
-    let meetingStillOpen = windows.contains { window in
-        guard let title = axString(window, kAXTitleAttribute as String) else { return false }
-        return meetingWindowTitles.contains(title)
+    if let meetingWindow = activeMeetingWindow(in: windows) {
+        observeMeetingEnd(for: meetingWindow)
+        return .meetingActive
     }
-    if meetingStillOpen { return .waiting }
 
     if windows.contains(where: {
         axString($0, kAXTitleAttribute as String) == targetWindowTitle
@@ -504,6 +542,7 @@ func reopenWorkplaceIfMeetingEnded(pid: pid_t) -> ReopenWorkplaceAttempt {
         return .done
     }
 
+    guard meetingEndConfirmed else { return .unconfirmedEnd }
     guard !reopenWorkplaceRequested else { return .waiting }
     guard let zoomURL = NSWorkspace.shared.urlForApplication(
         withBundleIdentifier: zoomBundleID
@@ -540,10 +579,24 @@ func scheduleReopenWorkplaceAfterMeeting(
     if reopenWorkplaceTimer?.isValid == true { return }
 
     var attempts = 0
+    var consecutiveAbsentChecks = 0
     reopenWorkplaceTimer = Timer.scheduledTimer(withTimeInterval: interval, repeats: true) { timer in
         attempts += 1
-        let result = reopenWorkplaceIfMeetingEnded(pid: pid)
-        if result == .done || result == .zoomNotRunning || attempts >= maxAttempts {
+        let result = reopenWorkplaceIfMeetingEnded(
+            pid: pid,
+            meetingEndConfirmed: consecutiveAbsentChecks >= 3
+        )
+        switch result {
+        case .unconfirmedEnd:
+            consecutiveAbsentChecks += 1
+        case .meetingActive, .done, .zoomNotRunning:
+            timer.invalidate()
+            reopenWorkplaceTimer = nil
+        case .waiting:
+            break
+        }
+
+        if timer.isValid, attempts >= maxAttempts {
             if attempts >= maxAttempts && result == .waiting {
                 emit("Meeting ended; could not reopen \"\(targetWindowTitle)\"")
             }
@@ -556,13 +609,16 @@ func scheduleReopenWorkplaceAfterMeeting(
 enum RestoreMinimizedWorkplaceAttempt {
     case done
     case waiting
+    case unconfirmedEnd
+    case meetingActive
     case zoomNotRunning
 }
 
 var restoreMinimizedWorkplaceTimer: Timer?
 
 func restoreMinimizedWorkplaceIfMeetingEnded(
-    pid: pid_t
+    pid: pid_t,
+    meetingEndConfirmed: Bool
 ) -> RestoreMinimizedWorkplaceAttempt {
     guard let zoom = zoomApplication(),
           !zoom.isTerminated,
@@ -573,11 +629,10 @@ func restoreMinimizedWorkplaceIfMeetingEnded(
     let (error, windows) = copyZoomWindows(pid: pid)
     guard error == .success else { return .waiting }
 
-    let meetingStillOpen = windows.contains { window in
-        guard let title = axString(window, kAXTitleAttribute as String) else { return false }
-        return meetingWindowTitles.contains(title)
+    if let meetingWindow = activeMeetingWindow(in: windows) {
+        observeMeetingEnd(for: meetingWindow)
+        return .meetingActive
     }
-    if meetingStillOpen { return .waiting }
 
     guard let workplaceWindow = windows.first(where: {
         axString($0, kAXTitleAttribute as String) == targetWindowTitle
@@ -589,6 +644,7 @@ func restoreMinimizedWorkplaceIfMeetingEnded(
         return .done
     }
 
+    guard meetingEndConfirmed else { return .unconfirmedEnd }
     guard AXUIElementSetAttributeValue(
         workplaceWindow,
         kAXMinimizedAttribute as CFString,
@@ -609,13 +665,27 @@ func scheduleRestoreMinimizedWorkplaceAfterMeeting(
     if restoreMinimizedWorkplaceTimer?.isValid == true { return }
 
     var attempts = 0
+    var consecutiveAbsentChecks = 0
     restoreMinimizedWorkplaceTimer = Timer.scheduledTimer(
         withTimeInterval: interval,
         repeats: true
     ) { timer in
         attempts += 1
-        let result = restoreMinimizedWorkplaceIfMeetingEnded(pid: pid)
-        if result == .done || result == .zoomNotRunning || attempts >= maxAttempts {
+        let result = restoreMinimizedWorkplaceIfMeetingEnded(
+            pid: pid,
+            meetingEndConfirmed: consecutiveAbsentChecks >= 3
+        )
+        switch result {
+        case .unconfirmedEnd:
+            consecutiveAbsentChecks += 1
+        case .meetingActive, .done, .zoomNotRunning:
+            timer.invalidate()
+            restoreMinimizedWorkplaceTimer = nil
+        case .waiting:
+            break
+        }
+
+        if timer.isValid, attempts >= maxAttempts {
             if attempts >= maxAttempts && result == .waiting {
                 emit("Meeting ended; could not restore \"\(targetWindowTitle)\"")
             }
@@ -637,10 +707,7 @@ var chatPreviewTimer: Timer?
 func meetingWindow(pid: pid_t) -> AXUIElement? {
     let (error, windows) = copyZoomWindows(pid: pid)
     guard error == .success else { return nil }
-    return windows.first { window in
-        guard let title = axString(window, kAXTitleAttribute as String) else { return false }
-        return meetingWindowTitles.contains(title)
-    }
+    return titledMeetingWindow(in: windows)
 }
 
 enum ChatPreviewAttempt {
@@ -838,8 +905,10 @@ func axObserverCallback(
     }
 
     // Some Zoom versions focus another window before destroying the meeting
-    // window. Treat the disappearance of its exact title as the same transition.
-    if observedMeetingEndWindow != nil, meetingWindow(pid: observedPID) == nil {
+    // window. Treat all meeting UI disappearing as the same transition, while
+    // allowing the normal window to become floating screen-sharing controls.
+    if observedMeetingEndWindow != nil,
+       activeMeetingWindow(pid: observedPID) == nil {
         observedMeetingEndWindow = nil
         scheduleConfiguredMeetingEndAction(pid: observedPID)
     }
